@@ -212,8 +212,9 @@ static void dnstc_fini_instance(dnstc_instance *instance)
 	free(instance);
 }
 
-static int dnstc_init()
+static int dnstc_init(struct event_base *evbase)
 {
+	UNUSED(evbase);
 	dnstc_instance *tmp, *instance = NULL;
 
 	// TODO: init debug_dumper

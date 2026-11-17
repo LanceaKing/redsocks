@@ -840,8 +840,9 @@ static void redudp_fini_instance(redudp_instance *instance)
 	free(instance);
 }
 
-static int redudp_init()
+static int redudp_init(struct event_base *evbase)
 {
+	UNUSED(evbase);
 	redudp_instance *tmp, *instance = NULL;
 
 	// TODO: init debug_dumper

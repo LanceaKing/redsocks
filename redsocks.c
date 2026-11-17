@@ -1457,7 +1457,8 @@ static int redsocks_fini();
 
 static struct event debug_dumper;
 
-static int redsocks_init() {
+static int redsocks_init(struct event_base *evbase) {
+	UNUSED(evbase);
 	struct sigaction sa = { }, sa_old = { };
 	redsocks_instance *tmp, *instance = NULL;
 

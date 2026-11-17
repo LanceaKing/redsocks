@@ -422,8 +422,9 @@ static void dnsu2t_fini_instance(dnsu2t_instance *instance)
 	free(instance);
 }
 
-static int dnsu2t_init()
+static int dnsu2t_init(struct event_base *evbase)
 {
+	UNUSED(evbase);
 	dnsu2t_instance *tmp, *instance = NULL;
 
 	list_for_each_entry_safe(instance, tmp, &instances, list) {

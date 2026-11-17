@@ -376,8 +376,9 @@ static parser_section base_conf_section =
  */
 static int base_fini();
 
-static int base_init()
+static int base_init(struct event_base *evbase)
 {
+	UNUSED(evbase);
 	uid_t uid = -1;
 	gid_t gid = -1;
 	int devnull = -1;
