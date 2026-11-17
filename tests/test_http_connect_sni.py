@@ -121,7 +121,7 @@ class MockProxy:
 
 
 class ConnectTests(unittest.TestCase):
-    binary = None
+    binary = str(Path(os.environ.get('REDSOCKS_BINARY', Path(__file__).resolve().parent.parent / 'redsocks')).resolve())
 
     def run_case(self, splice, *, name="www.temu.com", wire=None, fragment=16384,
                  bytewise=False, challenge=None, timeout=False, eof=False,
@@ -301,10 +301,12 @@ def add_tests():
             setattr(ConnectTests, f'test_{"splice" if splice else "buffer"}_{name}', test)
 
 
+add_tests()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=lambda p: str(Path(p).resolve()))
     args, remaining = parser.parse_known_args()
     ConnectTests.binary = args.binary
-    add_tests()
     unittest.main(argv=[__file__] + remaining, verbosity=2)

@@ -65,13 +65,40 @@ cmake --build build
 python3 tests/test_http_connect_sni.py --binary build/redsocks
 ```
 
-The `SNI CONNECT tests` GitHub Actions workflow runs these parser and CONNECT
-tests on native Ubuntu 24.04 runners with both GCC and Clang, ASan, and UBSan.
-It runs for pushes and pull requests and also supports manual dispatch.
-It does not use Docker, service containers, proxy credentials, or secrets.
+The `All tests` GitHub Actions workflow runs the parser tests and **every Python
+integration test**, including the original upstream suite, on native Ubuntu
+24.04 runners with both GCC and Clang, ASan and UBSan. It runs for pushes and
+pull requests and supports manual dispatch. It uses no Docker, service
+containers, real proxy credentials, or secrets.
 
-These focused tests are independent of the original Python 2 / Docker network
-test suite below and do not constitute live upstream/application acceptance.
+The upstream suite now uses Python 3 and Linux network namespaces. It preserves
+the original three-subnet topology and real nginx, Squid Basic/Digest, Dante
+SOCKS5 and inetd services. All authentication, upstream refusal/timeout, latency,
+Digest nonce reuse, impatient-client, FD leak and accept-overflow cases run.
+Bridges, routes, delay emulation and firewall rules stay inside temporary
+namespaces; service processes and the temporary Dante account are cleaned up.
+The old year-long `test_vmdebug` pause is now an explicit `--vmdebug` option,
+so the automated suite contains no intentionally skipped debug placeholder.
+
+To run the complete suite on an Ubuntu host without Docker:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential clang libclang-rt-dev libevent-dev \
+  python3 python3-pytest iproute2 iptables curl netcat-openbsd \
+  nginx-light squid dante-server xinetd
+tests/build
+tests/run-sni-tests.sh
+tests/run
+```
+
+`tests/run` invokes pytest over all Python tests and uses sudo for the namespace
+fixtures. For a CMake binary, set `REDSOCKS_BINARY` to its absolute path and
+`REDSOCKS_PRLIMIT` to the compiled `tests/prlimit-nofile` helper. The latency
+assertions use milliseconds consistently, and the nonce concurrency assertion
+converts wall-clock seconds to milliseconds. Network timeouts and FD pressure
+make the full suite take several minutes. These tests do not replace live
+upstream/application acceptance.
 
 This tool allows you to redirect any TCP connection to SOCKS or HTTPS
 proxy using your firewall, so redirection may be system-wide or network-wide.

@@ -1,13 +1,9 @@
 from functools import partial
-from subprocess import check_call, CalledProcessError, Popen, PIPE
+from subprocess import CalledProcessError, Popen, PIPE
 import time
 
 import conftest
 import pytest
-
-@pytest.mark.skipif(not pytest.config.getoption('--vmdebug'), reason='need --vmdebug option to run')
-def test_vmdebug(net):
-    check_call('sleep 365d'.split())
 
 GOOD_AUTH = 'connect_none connect_basic connect_digest socks5_none socks5_auth httperr_connect_digest'.split()
 BAD_AUTH = 'connect_nopass connect_baduser connect_badpass socks5_nopass socks5_baduser socks5_badpass httperr_proxy_refuse'.split()
@@ -57,8 +53,8 @@ def slow_net(request, net):
         net.vm['gw'].netcall('tc qdisc del dev ethx root')
         net.vm['gw'].netcall('tc qdisc del dev ethw root')
     request.addfinalizer(close)
-    net.vm['gw'].netcall('tc qdisc add dev ethw root netem delay %dms' % (RTT / 2))
-    net.vm['gw'].netcall('tc qdisc add dev ethx root netem delay %dms' % (RTT / 2))
+    net.vm['gw'].netcall('tc qdisc add dev ethw root netem delay %dms' % (RTT // 2))
+    net.vm['gw'].netcall('tc qdisc add dev ethx root netem delay %dms' % (RTT // 2))
     return net
 
 LATENCY = {
@@ -74,7 +70,7 @@ def heatup(vm):
     vm.do('curl -o /dev/null http://10.0.1.80/') # heatup L2 and auth caches
 
 def http_ping(vm):
-    s = vm.do('curl -sS -w %{{time_connect}}/%{{time_total}}/%{{http_code}}/%{{size_download}} -o /dev/null http://10.0.1.80/')
+    s = vm.do('curl -sS -w %{time_connect}/%{time_total}/%{http_code}/%{size_download} -o /dev/null http://10.0.1.80/')
     connect, total, code, size = s.split('/')
     connect, total, code, size = float(connect) * 1000, float(total) * 1000, int(code), int(size)
     return connect, total, code, size
@@ -85,7 +81,7 @@ def test_latency_tank(slow_net, tank):
     heatup(vm)
     connect, total, code, size = http_ping(vm)
     assert code == 200 and size == 612
-    assert connect < 0.005 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
+    assert connect < 5 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
 
 def test_latency_regw(slow_net):
     vm, tank = slow_net.vm['regw'], 'regw_direct'
@@ -104,12 +100,12 @@ def test_nonce_reuse(slow_net):
     total_sum = time.time() - begin
     for connect, total, code, size in s:
         assert code == 200 and size == 612
-        assert connect < 0.005 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
-        assert total_sum < total * 1.5
+        assert connect < 5 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
+        assert total_sum * 1000 < total * 1.5
 
 @pytest.mark.parametrize('tank, delay', [(t, d)
     for t in set(conftest.TANKS) & set(LATENCY)
-    for d in [_*0.001 for _ in range(1, LATENCY[t]+RTT, RTT/2)]
+    for d in [_*0.001 for _ in range(1, LATENCY[t]+RTT, RTT//2)]
 ] + [
     ('httperr_proxy_refuse', (1 + 0*RTT/2) * 0.001),
     ('httperr_proxy_refuse', (1 + 1*RTT/2) * 0.001),
@@ -123,7 +119,7 @@ def test_impatient_client(slow_net, tank, delay):
     try:
         page = vm.do('curl --max-time %s http://10.0.1.80/1M' % delay)
         #assert 'Welcome to nginx!' in page
-    except CalledProcessError, e:
+    except CalledProcessError as e:
         if tank == 'httperr_proxy_refuse':
             assert e.returncode in (28, 52) # Operation timeout / Empty reply
         else:
@@ -138,9 +134,9 @@ def test_impatient_client(slow_net, tank, delay):
 @pytest.fixture(scope='function', params=range(80, 60, -1))
 def lowfd_net(request, net):
     def close():
-        net.vm['regw'].call('sudo ./prlimit-nofile {pid} 1024')
+        net.vm['regw'].set_nofile(1024)
     request.addfinalizer(close)
-    net.vm['regw'].call('sudo ./prlimit-nofile {pid} %d' % request.param)
+    net.vm['regw'].set_nofile(request.param)
     return net
 
 def test_accept_overflow(lowfd_net):
@@ -148,14 +144,14 @@ def test_accept_overflow(lowfd_net):
     vm, regw = lowfd_net.vm['tank%d' % conftest.TANKS[tank]], lowfd_net.vm['regw']
     lsfd = regw.lsfd()
     year = str(time.gmtime().tm_year)
-    discard_cmd = vm.fmt('sudo docker exec --interactive {sha} nc 10.0.1.13 discard')
-    daytime_cmd = vm.fmt('sudo docker exec --interactive {sha} nc 10.0.1.13 daytime')
+    discard_cmd = vm.exec_cmd('nc -q 0 10.0.1.13 discard')
+    daytime_cmd = vm.exec_cmd('nc 10.0.1.13 daytime')
 
     dtstart = time.time()
     time.sleep(0.5)
-    proc = [Popen(discard_cmd, stdin=PIPE, stdout=PIPE) for i in xrange(7)]
+    proc = [Popen(discard_cmd, stdin=PIPE, stdout=PIPE, text=True) for i in range(7)]
     time.sleep(0.5)
-    dt = Popen(daytime_cmd, stdin=PIPE, stdout=PIPE)
+    dt = Popen(daytime_cmd, stdin=PIPE, stdout=PIPE, text=True)
     time.sleep(0.5)
     logs = regw.logs(since=dtstart)
     if any(['Too many open files' in _[1] for _ in logs]):
@@ -172,12 +168,12 @@ def test_accept_overflow(lowfd_net):
         assert year in daytime and dt.returncode == 0
         time.sleep(0.5)
         dtdeath = time.time()
-        proc.append(Popen(discard_cmd, stdin=PIPE, stdout=PIPE))
+        proc.append(Popen(discard_cmd, stdin=PIPE, stdout=PIPE, text=True))
         time.sleep(0.5)
         logs = regw.logs(since=dtdeath)
         assert any(['reached redsocks_conn_max limit' in _[1] for _ in logs])
         time.sleep(0.5)
-        dt = Popen(daytime_cmd, stdin=PIPE, stdout=PIPE)
+        dt = Popen(daytime_cmd, stdin=PIPE, stdout=PIPE, text=True)
         time.sleep(0.5)
         assert all([p.poll() is None for p in proc]) and dt.poll() is None # processes are running
         out, _ = proc[0].communicate('/dev/null\x0d\x0a')

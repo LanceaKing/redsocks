@@ -6,3 +6,6 @@ redsocks
 /gen
 /build/
 __pycache__/
+/test-results/
+/tests/prlimit-nofile
+/tests/__build-tstamp__

@@ -1,0 +1,74 @@
+name: All tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-tests:
+    name: Ubuntu / ${{ matrix.compiler }} / ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      CC: ${{ matrix.compiler }}
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      PYTHONHASHSEED: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-rt-dev cmake ninja-build libevent-dev \
+            python3 python3-pytest iproute2 iptables curl netcat-openbsd \
+            nginx-light squid dante-server xinetd
+
+      - name: Test TLS SNI parser with sanitizers
+        run: tests/run-sni-tests.sh
+
+      - name: Build redsocks with sanitizers
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build
+          "$CC" -std=c99 -D_GNU_SOURCE -Wall tests/prlimit-nofile.c -o build/prlimit-nofile
+
+      - name: Run every Python integration test
+        run: |
+          sudo env ASAN_OPTIONS="$ASAN_OPTIONS" UBSAN_OPTIONS="$UBSAN_OPTIONS" \
+            PYTHONHASHSEED="$PYTHONHASHSEED" \
+            REDSOCKS_BINARY="$PWD/build/redsocks" \
+            REDSOCKS_PRLIMIT="$PWD/build/prlimit-nofile" \
+            REDSOCKS_TEST_LOG_DIR="$PWD/test-results/network" \
+            /usr/bin/python3 -m pytest -v tests --junitxml=test-results/integration.xml
+
+      - name: Show native service logs on failure
+        if: failure()
+        run: |
+          if test -d test-results/network; then
+            sudo find test-results/network -name '*.log' -type f -exec tail -n 80 {} +
+          fi
+
+      - name: Upload test reports and native service logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.compiler }}
+          retention-days: 7
+          path: |
+            test-results/*.xml
+            test-results/**/*.log
