@@ -53,20 +53,22 @@ Run the portable parser tests with ASan and UBSan:
 tests/run-sni-tests.sh
 ```
 
-Run the loopback CONNECT tests on Linux (both pumps, no root/network required):
+Run the loopback CONNECT tests directly on Linux with sanitizers (both pumps,
+no root, external network, or containers required). Install a C compiler,
+CMake, Python 3 and libevent development headers first:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 cmake --build build
 python3 tests/test_http_connect_sni.py --binary build/redsocks
 ```
 
-Or run parser and CONNECT tests together in a Linux container with sanitizers:
-
-```sh
-podman build -f tests/sni.Dockerfile -t redsocks-sni-test .
-podman run --rm redsocks-sni-test
-```
+The `SNI CONNECT tests` GitHub Actions workflow runs these parser and CONNECT
+tests on native Ubuntu 24.04 runners with both GCC and Clang, ASan, and UBSan.
+It runs for pushes and pull requests and also supports manual dispatch.
+It does not use Docker, service containers, proxy credentials, or secrets.
 
 These focused tests are independent of the original Python 2 / Docker network
 test suite below and do not constitute live upstream/application acceptance.
