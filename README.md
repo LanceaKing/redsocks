@@ -73,11 +73,16 @@ includes the C parser checks (compiled and executed by pytest), the parameterize
 loopback CONNECT cases for both pumps, and the original upstream integration
 suite. The parser uses `CC`, `CPPFLAGS`, `CFLAGS` and `LDFLAGS` from the environment.
 
-The `All tests` GitHub Actions workflow invokes `tests/run` once per native
-Ubuntu 24.04 compiler job, with GCC or Clang, ASan and UBSan. All tests share
+The `Redsocks native tests` GitHub Actions workflow invokes `tests/run` once per
+native Ubuntu 24.04 compiler job, with GCC or Clang, ASan and UBSan. All tests share
 one test step and one JUnit report. The workflow runs for pushes and pull
 requests and supports manual dispatch. It uses no Docker, service containers,
 real proxy credentials, or secrets.
+
+This workflow owns redsocks protocol and shared-engine integration coverage,
+including its cntlm transport adapter. Standalone cntlm core/PAC regressions
+run in cntlm's own repository; Android builds and JNI/APK validation run in
+ProxyDroid's repository.
 
 The upstream suite now uses Python 3 and Linux network namespaces. It preserves
 the original three-subnet topology and real nginx, Squid Basic/Digest, Dante
@@ -92,7 +97,7 @@ To run the complete suite on an Ubuntu host without Docker:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-rt-dev cmake libevent-dev libssl-dev \
+sudo apt-get install -y build-essential clang libclang-rt-dev llvm cmake libevent-dev libssl-dev \
   python3 python3-pytest iproute2 iptables curl netcat-openbsd \
   nginx-light squid dante-server xinetd
 tests/build
