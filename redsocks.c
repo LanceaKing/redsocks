@@ -904,13 +904,27 @@ fail:
 	return retval;
 }
 
+typedef struct redsocks_message_request_t {
+	redsocks_message_maker maker;
+	redsocks_client *client;
+} redsocks_message_request;
+
+static struct evbuffer *redsocks_make_message_plain(void *p)
+{
+	redsocks_message_request *request = p;
+	return request->maker(request->client);
+}
+
 int redsocks_write_helper_ex(
 	struct bufferevent *buffev, redsocks_client *client,
 	redsocks_message_maker mkmessage, int state, size_t wm_low, size_t wm_high)
 {
+	/* The plain helper invokes its maker synchronously. Use an adapter rather
+	 * than calling a client callback through an incompatible void* signature. */
+	redsocks_message_request request = { mkmessage, client };
 	assert(client);
-	return redsocks_write_helper_ex_plain(buffev, client, (redsocks_message_maker_plain)mkmessage,
-	                                      client, state, wm_low, wm_high);
+	return redsocks_write_helper_ex_plain(buffev, client, mkmessage ? redsocks_make_message_plain : NULL,
+	                                      &request, state, wm_low, wm_high);
 }
 
 int redsocks_write_helper_ex_plain(
