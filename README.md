@@ -3,8 +3,8 @@
 ## HTTP CONNECT with TLS SNI (LanceaKing fork)
 
 This fork is based on `darkk/redsocks` master, commit
-`19b822e345f6a291f6cff6b168f1cfdfeeb2cd7d`. Development is on
-`feat/http-connect-sni`; `master` follows upstream.
+`19b822e345f6a291f6cff6b168f1cfdfeeb2cd7d`. Its `master` includes
+the HTTP CONNECT SNI fix and the complete automated test suite.
 
 Existing `type = http-connect` instances automatically inspect the first TLS
 ClientHello and send `CONNECT hostname:original-port` when it contains a valid
