@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 tests=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python=${PYTHON:-python3}
 if [ "$(id -u)" -ne 0 ]; then
-    exec sudo -E "$(command -v python3)" -m pytest -v "$tests" "$@"
+    exec sudo -E "$(command -v "$python")" -m pytest -v "$tests" "$@"
 fi
-exec python3 -m pytest -v "$tests" "$@"
+exec "$python" -m pytest -v "$tests" "$@"

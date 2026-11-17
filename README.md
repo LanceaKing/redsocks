@@ -47,29 +47,16 @@ against installed libevent, or be embedded with `add_subdirectory(redsocks)`
 after an existing `event` target. CMake generates the configuration and embeds
 the source commit in `redsocks -v`, including when `.git` is a submodule file.
 
-Run the portable parser tests with ASan and UBSan:
+Every test uses the same pytest framework and `tests/run` entry point. This
+includes the C parser checks (compiled and executed by pytest), the parameterized
+loopback CONNECT cases for both pumps, and the original upstream integration
+suite. The parser uses `CC`, `CPPFLAGS`, `CFLAGS` and `LDFLAGS` from the environment.
 
-```sh
-tests/run-sni-tests.sh
-```
-
-Run the loopback CONNECT tests directly on Linux with sanitizers (both pumps,
-no root, external network, or containers required). Install a C compiler,
-CMake, Python 3 and libevent development headers first:
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-cmake --build build
-python3 tests/test_http_connect_sni.py --binary build/redsocks
-```
-
-The `All tests` GitHub Actions workflow runs the parser tests and **every Python
-integration test**, including the original upstream suite, on native Ubuntu
-24.04 runners with both GCC and Clang, ASan and UBSan. It runs for pushes and
-pull requests and supports manual dispatch. It uses no Docker, service
-containers, real proxy credentials, or secrets.
+The `All tests` GitHub Actions workflow invokes `tests/run` once per native
+Ubuntu 24.04 compiler job, with GCC or Clang, ASan and UBSan. All tests share
+one test step and one JUnit report. The workflow runs for pushes and pull
+requests and supports manual dispatch. It uses no Docker, service containers,
+real proxy credentials, or secrets.
 
 The upstream suite now uses Python 3 and Linux network namespaces. It preserves
 the original three-subnet topology and real nginx, Squid Basic/Digest, Dante
@@ -88,17 +75,26 @@ sudo apt-get install -y build-essential clang libclang-rt-dev libevent-dev \
   python3 python3-pytest iproute2 iptables curl netcat-openbsd \
   nginx-light squid dante-server xinetd
 tests/build
-tests/run-sni-tests.sh
 tests/run
 ```
 
-`tests/run` invokes pytest over all Python tests and uses sudo for the namespace
+`make test` also builds and runs the complete suite through this same entry
+point. `tests/run` invokes pytest over all tests and uses sudo for the namespace
 fixtures. For a CMake binary, set `REDSOCKS_BINARY` to its absolute path and
 `REDSOCKS_PRLIMIT` to the compiled `tests/prlimit-nofile` helper. The latency
 assertions use milliseconds consistently, and the nonce concurrency assertion
 converts wall-clock seconds to milliseconds. Network timeouts and FD pressure
 make the full suite take several minutes. These tests do not replace live
 upstream/application acceptance.
+
+For a focused local check, use pytest selection with the same framework. The
+portable parser and loopback CONNECT cases do not need root or external network
+access (the CONNECT cases need a Linux redsocks binary):
+
+```sh
+REDSOCKS_BINARY="$PWD/redsocks" python3 -m pytest -v \
+  tests/test_tls_sni.py tests/test_http_connect_sni.py
+```
 
 This tool allows you to redirect any TCP connection to SOCKS or HTTPS
 proxy using your firewall, so redirection may be system-wide or network-wide.

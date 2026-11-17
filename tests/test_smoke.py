@@ -131,6 +131,24 @@ def test_impatient_client(slow_net, tank, delay):
         time.sleep(135) # default connect() timeout is long
     assert before == regw.lsfd() # no leaks
 
+@pytest.fixture
+def netcat(request):
+    def start(command):
+        process = Popen(command, stdin=PIPE, stdout=PIPE, text=True)
+
+        def close():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdin.close()
+            process.stdout.close()
+
+        request.addfinalizer(close)
+        return process
+
+    return start
+
+
 @pytest.fixture(scope='function', params=range(80, 60, -1))
 def lowfd_net(request, net):
     def close():
@@ -139,7 +157,7 @@ def lowfd_net(request, net):
     net.vm['regw'].set_nofile(request.param)
     return net
 
-def test_accept_overflow(lowfd_net):
+def test_accept_overflow(lowfd_net, netcat):
     tank = 'connect_none'
     vm, regw = lowfd_net.vm['tank%d' % conftest.TANKS[tank]], lowfd_net.vm['regw']
     lsfd = regw.lsfd()
@@ -149,39 +167,39 @@ def test_accept_overflow(lowfd_net):
 
     dtstart = time.time()
     time.sleep(0.5)
-    proc = [Popen(discard_cmd, stdin=PIPE, stdout=PIPE, text=True) for i in range(7)]
+    proc = [netcat(discard_cmd) for i in range(7)]
     time.sleep(0.5)
-    dt = Popen(daytime_cmd, stdin=PIPE, stdout=PIPE, text=True)
+    dt = netcat(daytime_cmd)
     time.sleep(0.5)
     logs = regw.logs(since=dtstart)
     if any(['Too many open files' in _[1] for _ in logs]):
         # anything may happen, except leaks
-        proc[0].communicate('/dev/null\x0d\x0a')
-        dt.communicate('')
+        proc[0].communicate('/dev/null\x0d\x0a', timeout=15)
+        dt.communicate('', timeout=15)
         time.sleep(1)
         for p in proc[1:]:
-            p.communicate('/dev/null\x0d\x0a')
+            p.communicate('/dev/null\x0d\x0a', timeout=15)
     else:
         assert any(['reached redsocks_conn_max limit' in _[1] for _ in logs])
         # RLIMIT_NOFILE was not hit, this `daytime` call actually returns data
-        daytime, _ = dt.communicate('')
+        daytime, _ = dt.communicate('', timeout=15)
         assert year in daytime and dt.returncode == 0
         time.sleep(0.5)
         dtdeath = time.time()
-        proc.append(Popen(discard_cmd, stdin=PIPE, stdout=PIPE, text=True))
+        proc.append(netcat(discard_cmd))
         time.sleep(0.5)
         logs = regw.logs(since=dtdeath)
         assert any(['reached redsocks_conn_max limit' in _[1] for _ in logs])
         time.sleep(0.5)
-        dt = Popen(daytime_cmd, stdin=PIPE, stdout=PIPE, text=True)
+        dt = netcat(daytime_cmd)
         time.sleep(0.5)
         assert all([p.poll() is None for p in proc]) and dt.poll() is None # processes are running
-        out, _ = proc[0].communicate('/dev/null\x0d\x0a')
-        daytime, _ = dt.communicate('')
+        out, _ = proc[0].communicate('/dev/null\x0d\x0a', timeout=15)
+        daytime, _ = dt.communicate('', timeout=15)
         assert year in daytime and dt.returncode == 0
         time.sleep(1)
         for p in proc[1:]:
-            out, _ = p.communicate('/dev/null\x0d\x0a')
+            out, _ = p.communicate('/dev/null\x0d\x0a', timeout=15)
             assert out == ''
 
     time.sleep(1)

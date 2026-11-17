@@ -57,7 +57,7 @@ class VM:
 
     def do(self, command):
         env = dict(os.environ, NO_PROXY='*', no_proxy='*')
-        return run(self.exec_cmd(command), env=env)
+        return run(self.exec_cmd(command), env=env, timeout=15)
 
     def netcall(self, command):
         return run(self.exec_cmd(command))
@@ -121,20 +121,21 @@ class VM:
 
 
 class Network:
-    def __init__(self):
+    def __init__(self, binary, prlimit):
         if os.geteuid() != 0:
             raise RuntimeError('Network tests need root: sudo -E tests/run')
         for program in ('ip', 'iptables', 'tc', 'ss', 'curl', 'nc', 'nginx',
                         'squid', 'danted', 'xinetd', 'useradd', 'userdel', 'chpasswd'):
             if not shutil.which(program):
                 raise RuntimeError('Missing native test dependency: ' + program)
-        self.binary = Path(os.environ.get('REDSOCKS_BINARY', ROOT.parent / 'redsocks')).resolve()
-        self.prlimit = Path(os.environ.get('REDSOCKS_PRLIMIT', ROOT / 'prlimit-nofile')).resolve()
-        if not self.binary.is_file() or not self.prlimit.is_file():
-            raise RuntimeError('Build redsocks and tests/prlimit-nofile first (tests/build)')
-        self.work = Path(os.environ.get('REDSOCKS_TEST_LOG_DIR') or tempfile.mkdtemp(prefix='redsocks-tests-')).resolve()
-        self.work.mkdir(parents=True, exist_ok=True)
+        self.binary = binary
+        self.prlimit = prlimit
+        # Squid's unprivileged helpers must be able to traverse every parent.
+        # Hosted runners may keep their workspace below a private home directory.
+        self.work = Path(tempfile.mkdtemp(prefix='redsocks-tests-')).resolve()
         self.work.chmod(0o755)
+        report = os.environ.get('REDSOCKS_TEST_LOG_DIR')
+        self.report = Path(report).resolve() if report else None
         self.prefix = 'redsocks-%d' % os.getpid()
         self.fabric = self.prefix + '-fabric'
         self.namespaces = []
@@ -276,5 +277,14 @@ pinger_enable off
             except BaseException as error:
                 failures.append(error)
             self.account = None
+        if self.report:
+            try:
+                for logfile in self.work.rglob('*.log'):
+                    destination = self.report / logfile.relative_to(self.work)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(logfile, destination)
+                shutil.rmtree(self.work)
+            except BaseException as error:
+                failures.append(error)
         if failures:
             raise failures[0]
