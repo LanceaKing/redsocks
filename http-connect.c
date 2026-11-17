@@ -30,6 +30,8 @@
 #include "log.h"
 #include "redsocks.h"
 #include "http-auth.h"
+#include "tls-sni.h"
+#include "utils.h"
 
 typedef enum httpc_state_t {
 	httpc_new,
@@ -41,7 +43,122 @@ typedef enum httpc_state_t {
 } httpc_state;
 
 
-#define HTTP_HEAD_WM_HIGH 4096  // that should be enough for one HTTP line.
+#define HTTP_HEAD_WM_HIGH (64 * 1024)
+
+typedef struct httpc_client_t {
+	struct event probe_timer;
+	everrorcb original_errorcb;
+	char authority[TLS_SNI_HOSTNAME_MAX + 7]; /* hostname, colon, port, NUL */
+	unsigned int auth_retries;
+	bool timer_active;
+	bool target_decided;
+} httpc_client;
+
+static void httpc_client_fini(redsocks_client *client)
+{
+	httpc_client *data = red_payload(client);
+	if (data->timer_active) {
+		evtimer_del(&data->probe_timer);
+		data->timer_active = false;
+	}
+	if (client->client && data->original_errorcb)
+		client->client->errorcb = data->original_errorcb;
+}
+
+static void httpc_choose_target(redsocks_client *client, const char *hostname, const char *reason)
+{
+	httpc_client *data = red_payload(client);
+	char ip[INET_ADDRSTRLEN];
+	if (data->target_decided)
+		return;
+	data->target_decided = true;
+	httpc_client_fini(client);
+	if (!hostname) {
+		hostname = inet_ntop(AF_INET, &client->destaddr.sin_addr, ip, sizeof(ip));
+		if (!hostname) {
+			redsocks_drop_client(client);
+			return;
+		}
+	}
+	snprintf(data->authority, sizeof(data->authority), "%s:%u", hostname,
+		ntohs(client->destaddr.sin_port));
+	redsocks_log_error(client, reason ? LOG_NOTICE : LOG_INFO, "HTTP CONNECT target=%s source=%s reason=%s",
+		data->authority, reason ? "original_ip" : "sni", reason ? reason : "found");
+	/* Keep every sniffed byte in input, and apply backpressure while CONNECT
+	 * and possible 407 reconnections are in progress. */
+	client->client->readcb = NULL;
+	if (bufferevent_disable(client->client, EV_READ) != 0) {
+		redsocks_log_errno(client, LOG_ERR, "bufferevent_disable");
+		redsocks_drop_client(client);
+		return;
+	}
+	redsocks_connect_relay(client);
+}
+
+static void httpc_probe_read_cb(struct bufferevent *buffev, void *_arg)
+{
+	redsocks_client *client = _arg;
+	char hostname[TLS_SNI_HOSTNAME_MAX + 1];
+	size_t length = evbuffer_get_length(buffev->input);
+	const unsigned char *bytes = evbuffer_pullup(buffev->input, length);
+	if (length && !bytes) {
+		redsocks_drop_client(client);
+		return;
+	}
+	redsocks_touch_client(client);
+	tls_sni_result result = tls_sni_parse(bytes, length, hostname);
+	if (result == TLS_SNI_FOUND)
+		httpc_choose_target(client, hostname, NULL);
+	else if (result == TLS_SNI_INVALID)
+		httpc_choose_target(client, NULL, "invalid_client_hello");
+	else if (result == TLS_SNI_NO_SNI)
+		httpc_choose_target(client, NULL, length && bytes[0] != 22 ? "non_tls" : "no_sni");
+	else if (length >= TLS_SNI_PROBE_MAX)
+		httpc_choose_target(client, NULL, "probe_limit");
+}
+
+static void httpc_probe_timeout_cb(int fd, short what, void *_arg)
+{
+	redsocks_client *client = _arg;
+	httpc_client *data = red_payload(client);
+	data->timer_active = false;
+	httpc_choose_target(client, NULL, "probe_timeout");
+}
+
+static void httpc_probe_error_cb(struct bufferevent *buffev, short what, void *_arg)
+{
+	redsocks_client *client = _arg;
+	redsocks_log_error(client, LOG_INFO, "HTTP CONNECT probe stopped reason=%s",
+		(what & EVBUFFER_EOF) ? "client_eof" : "client_error");
+	redsocks_drop_client(client);
+}
+
+static void httpc_connect_relay(redsocks_client *client)
+{
+	httpc_client *data = red_payload(client);
+	struct timeval now, elapsed, deadline = { 1, 0 }, remaining;
+	data->original_errorcb = client->client->errorcb;
+	client->client->readcb = httpc_probe_read_cb;
+	client->client->errorcb = httpc_probe_error_cb;
+	bufferevent_setwatermark(client->client, EV_READ, 1, TLS_SNI_PROBE_MAX);
+	if (redsocks_gettimeofday(&now) != 0) {
+		httpc_choose_target(client, NULL, "probe_clock_error");
+		return;
+	}
+	timersub(&now, &client->first_event, &elapsed);
+	if (timercmp(&elapsed, &deadline, >=)) {
+		httpc_choose_target(client, NULL, "probe_timeout");
+		return;
+	}
+	timersub(&deadline, &elapsed, &remaining);
+	evtimer_set(&data->probe_timer, httpc_probe_timeout_cb, client);
+	if (evtimer_add(&data->probe_timer, &remaining) != 0) {
+		redsocks_log_errno(client, LOG_ERR, "evtimer_add");
+		redsocks_drop_client(client);
+		return;
+	}
+	data->timer_active = true;
+}
 
 
 static void httpc_client_init(redsocks_client *client)
@@ -61,148 +178,113 @@ static struct evbuffer *httpc_mkconnect(redsocks_client *client);
 extern const char *auth_request_header;
 extern const char *auth_response_header;
 
+/* The whole header block must arrive before parsing 407. Reading its first
+ * line early used to lose a fragmented Proxy-Authenticate header. */
+static char *httpc_auth_challenge(char *headers)
+{
+	char *line = strchr(headers, '\n');
+	while (line && *++line) {
+		char *next = strchr(line, '\n');
+		if (!next)
+			break;
+		*next = '\0';
+		if (next > line && next[-1] == '\r')
+			next[-1] = '\0';
+		if (strncasecmp(line, auth_request_header, strlen(auth_request_header)) == 0) {
+			char *value = line + strlen(auth_request_header);
+			while (isspace((unsigned char)*value))
+				++value;
+			if (strncasecmp(value, "Basic ", 6) == 0 || strncasecmp(value, "Digest ", 7) == 0)
+				return strdup(value);
+		}
+		line = next;
+	}
+	return NULL;
+}
+
 static void httpc_read_cb(struct bufferevent *buffev, void *_arg)
 {
 	redsocks_client *client = _arg;
-
+	httpc_client *data = red_payload(client);
+	size_t length = evbuffer_get_length(buffev->input), delimiter = 4;
 	assert(client->relay == buffev);
-	assert(client->state == httpc_request_sent || client->state == httpc_reply_came);
-
+	assert(client->state == httpc_request_sent);
 	redsocks_touch_client(client);
 
-	// evbuffer_add() triggers callbacks, so we can't write to client->client
-	// till we know that we're going to ONFAIL_FORWARD_HTTP_ERR.
-	// And the decision is made when all the headers are processed.
-	struct evbuffer* tee = NULL;
-	const bool do_errtee = client->instance->config.on_proxy_fail == ONFAIL_FORWARD_HTTP_ERR;
-
-	if (client->state == httpc_request_sent) {
-		size_t len = evbuffer_get_length(buffev->input);
-		char *line = redsocks_evbuffer_readline(buffev->input);
-		if (line) {
-			unsigned int code;
-			if (sscanf(line, "HTTP/%*u.%*u %u", &code) == 1) { // 1 == one _assigned_ match
-				if (code == 407) { // auth failed
-					http_auth *auth = red_http_auth(client->instance);
-
-					if (auth->last_auth_query != NULL && auth->last_auth_count == 1) {
-						redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth failed: %s", line);
-						client->state = httpc_no_way;
-					} else if (client->instance->config.login == NULL || client->instance->config.password == NULL) {
-						redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth required, but no login/password configured: %s", line);
-						client->state = httpc_no_way;
-					} else {
-						if (do_errtee)
-							tee = evbuffer_new();
-						char *auth_request = http_auth_request_header(buffev->input, tee);
-						if (!auth_request) {
-							redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth required, but no <%s> header found: %s", auth_request_header, line);
-							client->state = httpc_no_way;
-						} else {
-							free(line);
-							if (tee)
-								evbuffer_free(tee);
-							free(auth->last_auth_query);
-							char *ptr = auth_request;
-
-							ptr += strlen(auth_request_header);
-							while (isspace(*ptr))
-								ptr++;
-
-							size_t last_auth_query_len = strlen(ptr) + 1;
-							auth->last_auth_query = calloc(last_auth_query_len, 1);
-							memcpy(auth->last_auth_query, ptr, last_auth_query_len);
-							auth->last_auth_count = 0;
-
-							free(auth_request);
-
-							if (bufferevent_disable(client->relay, EV_WRITE)) {
-								redsocks_log_errno(client, LOG_ERR, "bufferevent_disable");
-								return;
-							}
-
-							/* close relay tunnel */
-							redsocks_bufferevent_free(client->relay);
-
-							/* set to initial state*/
-							client->state = httpc_new;
-
-							/* and reconnect */
-							redsocks_connect_relay(client);
-							return;
-						}
-					}
-				} else if (200 <= code && code <= 299) {
-					client->state = httpc_reply_came;
-				} else {
-					redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy error: %s", line);
-					client->state = httpc_no_way;
-				}
-			} else {
-				redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy bad firstline: %s", line);
-				client->state = httpc_no_way;
-			}
-			if (do_errtee && client->state == httpc_no_way) {
-				if (bufferevent_write(client->client, line, strlen(line)) != 0 ||
-				    bufferevent_write(client->client, "\r\n", 2) != 0)
-				{
-					redsocks_log_errno(client, LOG_NOTICE, "bufferevent_write");
-					goto fail;
-				}
-			}
-			free(line);
-		}
-		else if (len >= HTTP_HEAD_WM_HIGH) {
-			redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy reply is too long, %zu bytes", len);
-			client->state = httpc_no_way;
-		}
+	struct evbuffer_ptr end = evbuffer_search(buffev->input, "\r\n\r\n", 4, NULL);
+	if (end.pos < 0) {
+		end = evbuffer_search(buffev->input, "\n\n", 2, NULL);
+		delimiter = 2;
 	}
-
-	if (do_errtee && client->state == httpc_no_way) {
-		if (tee) {
-			if (bufferevent_write_buffer(client->client, tee) != 0) {
-				redsocks_log_errno(client, LOG_NOTICE, "bufferevent_write_buffer");
-				goto fail;
-			}
+	if (end.pos < 0) {
+		if (length >= HTTP_HEAD_WM_HIGH) {
+			redsocks_log_error(client, LOG_NOTICE, "HTTP CONNECT target=%s status=oversized_headers", data->authority);
+			redsocks_drop_client(client);
 		}
-		redsocks_shutdown(client, client->client, SHUT_RD);
-		const size_t avail = evbuffer_get_length(client->client->input);
-		if (avail) {
-			if (evbuffer_drain(client->client->input, avail) != 0) {
-				redsocks_log_errno(client, LOG_NOTICE, "evbuffer_drain");
-				goto fail;
-			}
-		}
-		redsocks_shutdown(client, client->relay, SHUT_WR);
-		client->state = httpc_headers_skipped;
+		return;
 	}
-
-fail:
-	if (tee) {
-		evbuffer_free(tee);
-	}
-
-	if (client->state == httpc_no_way) {
+	size_t headers_length = (size_t)end.pos + delimiter;
+	if (headers_length > HTTP_HEAD_WM_HIGH) {
 		redsocks_drop_client(client);
 		return;
 	}
+	char *headers = malloc(headers_length + 1);
+	if (!headers) {
+		redsocks_drop_client(client);
+		return;
+	}
+	evbuffer_copyout(buffev->input, headers, headers_length);
+	headers[headers_length] = '\0';
+	unsigned int code = 0;
+	if (memchr(headers, '\0', headers_length) ||
+		sscanf(headers, "HTTP/%*u.%*u %u", &code) != 1 || code < 100 || code > 599)
+		code = 0;
+	redsocks_log_error(client, code >= 200 && code <= 299 ? LOG_INFO : LOG_NOTICE,
+		"HTTP CONNECT target=%s status=%u", data->authority, code);
 
-	while (client->state == httpc_reply_came) {
-		char *line = redsocks_evbuffer_readline(buffev->input);
-		if (line) {
-			if (strlen(line) == 0) {
-				client->state = httpc_headers_skipped;
-			}
-			free(line);
-		}
-		else {
-			break;
+	if (code == 407 && data->auth_retries == 0 &&
+		client->instance->config.login && client->instance->config.password) {
+		char *challenge = httpc_auth_challenge(headers);
+		if (challenge) {
+			http_auth *auth = red_http_auth(client->instance);
+			free(auth->last_auth_query);
+			auth->last_auth_query = challenge;
+			auth->last_auth_count = 0;
+			++data->auth_retries;
+			free(headers);
+			redsocks_bufferevent_free(client->relay);
+			client->relay = NULL;
+			client->state = httpc_new;
+			/* Frozen authority and original client input survive reconnection. */
+			redsocks_connect_relay(client);
+			return;
 		}
 	}
+	free(headers);
 
-	if (client->state == httpc_headers_skipped) {
-		redsocks_start_relay(client);
+	if (code >= 200 && code <= 299) {
+		evbuffer_drain(buffev->input, headers_length);
+		/* Move the original bytes exactly once, only after final 2xx headers.
+		 * Both the buffer and splice pumps drain relay->output first. */
+		if (bufferevent_write_buffer(client->relay, client->client->input) != 0)
+			goto fail;
+	} else if (client->instance->config.on_proxy_fail == ONFAIL_FORWARD_HTTP_ERR) {
+		evbuffer_drain(client->client->input, evbuffer_get_length(client->client->input));
+		redsocks_shutdown(client, client->client, SHUT_RD);
+		redsocks_shutdown(client, client->relay, SHUT_WR);
+	} else {
+		goto fail;
 	}
+	/* Include any bytes already received after the response headers, rather
+	 * than waiting for a new socket read to wake the buffer pump. */
+	if (bufferevent_write_buffer(client->client, client->relay->input) != 0)
+		goto fail;
+	client->state = httpc_headers_skipped;
+	redsocks_start_relay(client); /* may free client */
+	return;
+
+fail:
+	redsocks_drop_client(client);
 }
 
 static struct evbuffer *httpc_mkconnect(redsocks_client *client)
@@ -229,9 +311,7 @@ static struct evbuffer *httpc_mkconnect(redsocks_client *client)
 			auth_string = basic_authentication_encode(client->instance->config.login, client->instance->config.password);
 			auth_scheme = "Basic";
 		} else if (strncasecmp(auth->last_auth_query, "Digest", 6) == 0) {
-			/* calculate uri */
-			char uri[128];
-			snprintf(uri, 128, "%s:%u", inet_ntoa(client->destaddr.sin_addr), ntohs(client->destaddr.sin_port));
+			const char *uri = ((httpc_client *)red_payload(client))->authority;
 
 			/* prepare an random string for cnounce */
 			char cnounce[17];
@@ -242,12 +322,15 @@ static struct evbuffer *httpc_mkconnect(redsocks_client *client)
 					"CONNECT", uri, auth->last_auth_count, cnounce); // method, path, nc, cnounce
 			auth_scheme = "Digest";
 		}
+	} else if (client->instance->config.login && client->instance->config.password) {
+		/* Preserve ProxyDroid's preemptive Basic behavior for existing profiles. */
+		auth_string = basic_authentication_encode(client->instance->config.login, client->instance->config.password);
+		auth_scheme = "Basic";
 	}
 
 	// TODO: do accurate evbuffer_expand() while cleaning up http-auth
-	len = evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\r\n",
-		inet_ntoa(client->destaddr.sin_addr),
-		ntohs(client->destaddr.sin_port));
+	len = evbuffer_add_printf(buff, "CONNECT %s HTTP/1.0\r\n",
+		((httpc_client *)red_payload(client))->authority);
 	if (len < 0) {
 		redsocks_log_errno(client, LOG_ERR, "evbufer_add_printf");
 		goto fail;
@@ -325,11 +408,13 @@ static void httpc_write_cb(struct bufferevent *buffev, void *_arg)
 relay_subsys http_connect_subsys =
 {
 	.name                 = "http-connect",
-	.payload_len          = 0,
+	.payload_len          = sizeof(httpc_client),
 	.instance_payload_len = sizeof(http_auth),
 	.readcb               = httpc_read_cb,
 	.writecb              = httpc_write_cb,
 	.init                 = httpc_client_init,
+	.fini                 = httpc_client_fini,
+	.connect_relay        = httpc_connect_relay,
 	.instance_fini        = httpc_instance_fini,
 };
 

@@ -28,6 +28,19 @@
 #include <errno.h>
 #include <assert.h>
 #include <fcntl.h>
+#if defined(__ANDROID__) && __ANDROID_API__ < 21
+#include <sys/syscall.h>
+/* Bionic exports splice starting at API 21; the Linux syscall is older.
+ * Keep API 19/20 builds working without changing newer Android or Linux. */
+#define SPLICE_F_MOVE 1
+#define SPLICE_F_NONBLOCK 2
+static ssize_t red_android_splice(int in, off_t *inoff, int out, off_t *outoff,
+		size_t length, unsigned int flags)
+{
+	return syscall(__NR_splice, in, inoff, out, outoff, length, flags);
+}
+#define splice red_android_splice
+#endif
 #include <event.h>
 #include "list.h"
 #include "parser.h"

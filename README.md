@@ -1,5 +1,76 @@
 # redsocks – transparent TCP-to-proxy redirector
 
+## HTTP CONNECT with TLS SNI (LanceaKing fork)
+
+This fork is based on `darkk/redsocks` master, commit
+`19b822e345f6a291f6cff6b168f1cfdfeeb2cd7d`. Development is on
+`feat/http-connect-sni`; `master` follows upstream.
+
+Existing `type = http-connect` instances automatically inspect the first TLS
+ClientHello and send `CONNECT hostname:original-port` when it contains a valid
+ASCII DNS SNI. No new configuration field is required. For example, keep using:
+
+```conf
+redsocks {
+    local_ip = 127.0.0.1;
+    local_port = 12345;
+    ip = 192.0.2.10;
+    port = 3128;
+    type = http-connect;
+    login = "example-user";
+    password = "example-password";
+}
+```
+
+TCP fragmentation and ClientHello messages spanning TLS records are supported.
+The probe buffers at most 64 KiB and waits at most one second from acceptance.
+Non-TLS traffic, missing/invalid SNI, the size limit, and the deadline select the
+original IP CONNECT through the same configured upstream and log the reason.
+Server-first protocols therefore incur up to one second of initial delay.
+An upstream that rejects numeric CONNECT will still reject those fallbacks.
+
+The target is frozen across Basic/Digest authentication and 407 reconnections.
+Credentials retain preemptive Basic behavior; a 407 can negotiate Basic or
+Digest. The original TLS bytes are sent unchanged, only after a final upstream
+2xx and its complete header block. Both buffer and Linux splice pumps are
+supported, including Android API 19/20 via the existing Linux splice syscall.
+No TLS termination, certificate substitution, DNS cache, direct connection, or
+upstream startup probe is used. ECH's hidden inner name cannot be recovered;
+only a visible outer SNI can be inspected. QUIC/UDP is outside this TCP module.
+
+`log_info = on` records the selected authority and upstream status. Fallbacks
+and failures are also logged when informational logging is off. These messages
+never contain credentials, authentication challenges, or ClientHello contents.
+
+The original Linux Makefile remains supported. CMake can also build standalone
+against installed libevent, or be embedded with `add_subdirectory(redsocks)`
+after an existing `event` target. CMake generates the configuration and embeds
+the source commit in `redsocks -v`, including when `.git` is a submodule file.
+
+Run the portable parser tests with ASan and UBSan:
+
+```sh
+tests/run-sni-tests.sh
+```
+
+Run the loopback CONNECT tests on Linux (both pumps, no root/network required):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+python3 tests/test_http_connect_sni.py --binary build/redsocks
+```
+
+Or run parser and CONNECT tests together in a Linux container with sanitizers:
+
+```sh
+podman build -f tests/sni.Dockerfile -t redsocks-sni-test .
+podman run --rm redsocks-sni-test
+```
+
+These focused tests are independent of the original Python 2 / Docker network
+test suite below and do not constitute live upstream/application acceptance.
+
 This tool allows you to redirect any TCP connection to SOCKS or HTTPS
 proxy using your firewall, so redirection may be system-wide or network-wide.
 
