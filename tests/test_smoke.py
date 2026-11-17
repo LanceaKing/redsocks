@@ -115,7 +115,7 @@ def test_nonce_reuse(slow_net):
 ])
 def test_impatient_client(slow_net, tank, delay):
     vm, regw = slow_net.vm['tank%d' % conftest.TANKS[tank]], slow_net.vm['regw']
-    before, start = regw.lsfd(), time.time()
+    before, start = regw.wait_idle(), time.time()
     try:
         page = vm.do('curl --max-time %s http://10.0.1.80/1M' % delay)
         #assert 'Welcome to nginx!' in page
@@ -129,7 +129,7 @@ def test_impatient_client(slow_net, tank, delay):
     time.sleep( (LATENCY.get(tank, delay*1000) + 4*RTT)*0.001 )
     if tank == 'httperr_proxy_timeout':
         time.sleep(135) # default connect() timeout is long
-    assert before == regw.lsfd() # no leaks
+    assert before == regw.wait_idle() # no leaks, including delayed FIN delivery
 
 @pytest.fixture
 def netcat(request):
@@ -160,7 +160,7 @@ def lowfd_net(request, net):
 def test_accept_overflow(lowfd_net, netcat):
     tank = 'connect_none'
     vm, regw = lowfd_net.vm['tank%d' % conftest.TANKS[tank]], lowfd_net.vm['regw']
-    lsfd = regw.lsfd()
+    lsfd = regw.wait_idle()
     year = str(time.gmtime().tm_year)
     discard_cmd = vm.exec_cmd('nc -q 0 10.0.1.13 discard')
     daytime_cmd = vm.exec_cmd('nc 10.0.1.13 daytime')
@@ -168,9 +168,11 @@ def test_accept_overflow(lowfd_net, netcat):
     dtstart = time.time()
     time.sleep(0.5)
     proc = [netcat(discard_cmd) for i in range(7)]
-    time.sleep(0.5)
+    # Server-first protocols use the one-second SNI deadline before opening
+    # their upstream. Observe FD pressure only after those pumps are created.
+    time.sleep(1.5)
     dt = netcat(daytime_cmd)
-    time.sleep(0.5)
+    time.sleep(1.5)
     logs = regw.logs(since=dtstart)
     if any(['Too many open files' in _[1] for _ in logs]):
         # anything may happen, except leaks
@@ -187,7 +189,7 @@ def test_accept_overflow(lowfd_net, netcat):
         time.sleep(0.5)
         dtdeath = time.time()
         proc.append(netcat(discard_cmd))
-        time.sleep(0.5)
+        time.sleep(1.5)
         logs = regw.logs(since=dtdeath)
         assert any(['reached redsocks_conn_max limit' in _[1] for _ in logs])
         time.sleep(0.5)
@@ -203,4 +205,4 @@ def test_accept_overflow(lowfd_net, netcat):
             assert out == ''
 
     time.sleep(1)
-    assert lsfd == regw.lsfd() # no leaks
+    assert lsfd == regw.wait_idle() # no leaks

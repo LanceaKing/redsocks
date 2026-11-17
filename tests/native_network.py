@@ -33,7 +33,10 @@ def pmap(functions):
 
 
 def run(command, **kwargs):
-    return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, **kwargs)
+    # curl may return an arbitrary binary body; preserve it losslessly while
+    # retaining the text interface used by the original Python 2 tests.
+    return subprocess.check_output(command, text=True, encoding='utf-8',
+                                   errors='surrogateescape', stderr=subprocess.STDOUT, **kwargs)
 
 
 class VM:
@@ -93,6 +96,17 @@ class VM:
 
     def lsfd(self):
         return sorted(int(path.name) for path in Path('/proc/%d/fd' % self.pid).iterdir())
+
+    def wait_idle(self):
+        deadline = time.monotonic() + 5
+        while True:
+            actual = self.lsfd()
+            if actual == self.idle_fds:
+                return actual
+            if time.monotonic() >= deadline:
+                raise AssertionError('FDs did not return to the idle baseline: %r != %r' %
+                                     (actual, self.idle_fds))
+            time.sleep(.05)
 
     def set_nofile(self, limit):
         run([str(self.network.prlimit), str(self.pid), str(limit)])
@@ -242,6 +256,7 @@ pinger_enable off
         conf = self.work / 'redsocks.conf'
         conf.write_text(config)
         regw.start('%s -c %s' % (shlex.quote(str(self.binary)), shlex.quote(str(conf))), list(range(12340, 12357)))
+        regw.idle_fds = regw.lsfd()
         for number in TANKS.values():
             tank = VM(self, 'tank%d' % number)
             tank.connect('tank', '10.0.2.%d' % number, 'etht', '10.0.2.123')
