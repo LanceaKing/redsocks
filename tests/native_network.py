@@ -97,8 +97,8 @@ class VM:
     def lsfd(self):
         return sorted(int(path.name) for path in Path('/proc/%d/fd' % self.pid).iterdir())
 
-    def wait_idle(self):
-        deadline = time.monotonic() + 5
+    def wait_idle(self, timeout=5):
+        deadline = time.monotonic() + timeout
         while True:
             actual = self.lsfd()
             if actual == self.idle_fds:

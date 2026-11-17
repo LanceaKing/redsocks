@@ -36,6 +36,9 @@ def test_econnrefused(net, tank):
         vm.do('curl --max-time 0.5 http://10.0.1.80:81/')
     if tank == 'httperr_proxy_timeout':
         assert excinfo.value.returncode == 28 # Operation timed out
+        # The client's deadline does not end the kernel's pending upstream
+        # connect(). Drain it before later tests record their FD baseline.
+        net.vm['regw'].wait_idle(timeout=145)
     else:
         assert excinfo.value.returncode == 52 # Empty reply from server
 
@@ -128,7 +131,7 @@ def test_impatient_client(slow_net, tank, delay):
     assert curl_time < delay + RTT*0.001 # sanity check
     time.sleep( (LATENCY.get(tank, delay*1000) + 4*RTT)*0.001 )
     if tank == 'httperr_proxy_timeout':
-        time.sleep(135) # default connect() timeout is long
+        regw.wait_idle(timeout=145) # default connect() timeout is long
     assert before == regw.wait_idle() # no leaks, including delayed FIN delivery
 
 @pytest.fixture
