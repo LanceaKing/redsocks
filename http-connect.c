@@ -92,7 +92,10 @@ static void httpc_choose_target(redsocks_client *client, const char *hostname, c
 		redsocks_drop_client(client);
 		return;
 	}
-	redsocks_connect_relay(client);
+	if (client->instance->config.cntlm_context)
+		redsocks_cntlm_handoff(client, data->authority);
+	else
+		redsocks_connect_relay(client);
 }
 
 static void httpc_probe_read_cb(struct bufferevent *buffev, void *_arg)

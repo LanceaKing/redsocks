@@ -119,6 +119,7 @@ static int dnstc_onenter(parser_section *section)
 	}
 
 	INIT_LIST_HEAD(&instance->list);
+	list_add(&instance->list, &instances);
 	instance->config.bindaddr.sin_family = AF_INET;
 	instance->config.bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
@@ -141,7 +142,7 @@ static int dnstc_onexit(parser_section *section)
 
 	instance->config.bindaddr.sin_port = htons(instance->config.bindaddr.sin_port);
 
-	list_add(&instance->list, &instances);
+
 
 	return 0;
 }

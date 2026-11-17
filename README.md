@@ -1,10 +1,31 @@
 # redsocks – transparent TCP-to-proxy redirector
 
+## Shared engine, upstream TLS and cntlm
+
+Development for this integration is on `feat/redsocks-upstream-tls`.
+Initialize dependencies with `git submodule update --init --recursive`.
+The patched cntlm fork is a normal submodule at `cntlm/`, based on upstream
+master `678d30b8ab4b0b2e3fb89a43bbeedd42d385e5f7` (version 0.94.1).
+CMake compiles it directly; no build-time source patching is involved.
+
+CMake builds `libredsocks.so` and a thin Linux CLI using the same core. The
+embedding API owns an explicit event base, worker lifecycle, configuration
+validation and diagnostics. HTTPS upstreams support TLS 1.2+, SNI and mandatory
+certificate/hostname verification. TLS traffic always uses buffered I/O.
+Cntlm authentication, failover and cached sockets use that same TLS stream.
+The host never starts a second proxy process or loopback authentication bridge.
+
+See [docs/embedding.md](docs/embedding.md) for complete C and CLI examples,
+configuration options, cntlm capabilities and focused regression commands.
+The original redsocks sources retain their Apache-2.0 license; the cntlm
+submodule is GPL-2.0-or-later. See each project's license files when distributing
+a combined build.
+
 ## HTTP CONNECT with TLS SNI (LanceaKing fork)
 
 This fork is based on `darkk/redsocks` master, commit
 `19b822e345f6a291f6cff6b168f1cfdfeeb2cd7d`. Development is on
-`feat/http-connect-sni`; `master` follows upstream.
+`feat/http-connect-sni`; this integration extends that work.
 
 Existing `type = http-connect` instances automatically inspect the first TLS
 ClientHello and send `CONNECT hostname:original-port` when it contains a valid
@@ -71,7 +92,7 @@ To run the complete suite on an Ubuntu host without Docker:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-rt-dev libevent-dev \
+sudo apt-get install -y build-essential clang libclang-rt-dev cmake libevent-dev libssl-dev \
   python3 python3-pytest iproute2 iptables curl netcat-openbsd \
   nginx-light squid dante-server xinetd
 tests/build
@@ -169,7 +190,7 @@ proxy server.
 
 Login/password authentication is supported for Socks5/HTTPS connections.
 Socks4 supports only username, password is ignored. for HTTPS, currently
-only Basic and Digest scheme is supported.
+Basic, Digest and embedded cntlm NTLM dialects are supported.
 
 Redirect UDP packets via Socks5 proxy server. NB: UDP still goes via UDP, so
 you can't relay UDP via OpenSSH.
@@ -238,7 +259,8 @@ AKA @semigodking who is actively maintaining the fork with GFW in mind.
 
 ## License
 
-All source code is licensed under Apache 2.0 license.
+The original redsocks source code is licensed under Apache 2.0; the optional
+combined cntlm build also includes GPL-2.0-or-later sources from `cntlm/`.
 You can get a copy at http://www.apache.org/licenses/LICENSE-2.0.html
 
 ## Packages
@@ -269,8 +291,9 @@ Program has following command-line options:
 * `-p` set a file to write the getpid() into
 
 Following signals are understood:
-SIGUSR1 dumps list of connected clients to log,
-SIGTERM and SIGINT terminates daemon, all active connections are closed.
+The Linux CLI handles SIGTERM and SIGINT by stopping the shared engine and
+closing active connections. The embedded library does not install process
+signal handlers or daemonize.
 
 You can see configuration file example in [redsocks.conf.example](https://github.com/darkk/redsocks/blob/master/redsocks.conf.example).
 

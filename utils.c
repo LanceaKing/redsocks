@@ -135,6 +135,7 @@ int red_socket_client(int type)
 		goto fail;
 	}
 
+	if (redsocks_apply_socket_mark(fd)) goto fail;
 	error = fcntl_nonblock(fd);
 	if (error) {
 		log_errno(LOG_ERR, "fcntl");

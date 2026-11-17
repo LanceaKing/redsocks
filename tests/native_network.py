@@ -266,7 +266,12 @@ pinger_enable off
         ordered = sorted(self.vm.values(), key=lambda vm: vm.name != 'regw')
         for vm in ordered:
             try:
-                vm.stop()
+                try:
+                    if self.ready and vm.name == 'regw':
+                        # Client curl may exit before shaped FINs reach regw.
+                        vm.wait_idle()
+                finally:
+                    vm.stop()
                 if self.ready and vm.name == 'regw':
                     log = vm.logpath.read_text(errors='replace')
                     assert vm.process.returncode == 0, log

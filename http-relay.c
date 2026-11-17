@@ -168,7 +168,7 @@ static void httpr_relay_read_cb(struct bufferevent *buffev, void *_arg)
 						char *auth_request = http_auth_request_header(buffev->input, NULL);
 
 						if (!auth_request) {
-							redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth required, but no <%s> header found: %s", auth_request_header, line);
+							redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth required, but no <%s> header found", auth_request_header);
 							redsocks_drop_client(client);
 							dropped = 1;
 						} else {
@@ -547,6 +547,10 @@ static void httpr_client_read_cb(struct bufferevent *buffev, void *_arg)
 
 static void httpr_connect_relay(redsocks_client *client)
 {
+	if (client->instance->config.cntlm_context) {
+		redsocks_cntlm_handoff(client, NULL);
+		return;
+	}
 	int error;
 
 	client->client->readcb = httpr_client_read_cb;

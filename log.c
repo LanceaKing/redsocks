@@ -197,3 +197,12 @@ void _log_write(const char *file, int line, const char *func, int do_errno, int 
 
 /* vim:set tabstop=4 softtabstop=4 shiftwidth=4: */
 /* vim:set foldmethod=marker foldlevel=32 foldmarker={,}: */
+
+void redsocks_log_reset(void) {
+    if (logfile) fclose(logfile);
+    logfile = NULL;
+    log_msg = stderr_msg;
+    log_msg_next = NULL;
+    should_log_info = true;
+    should_log_debug = false;
+}

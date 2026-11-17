@@ -23,7 +23,6 @@
 #include <ctype.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <time.h>
 #include <errno.h>
 #include <assert.h>
@@ -50,6 +49,9 @@ static ssize_t red_android_splice(int in, off_t *inoff, int out, off_t *outoff,
 #include "redsocks.h"
 #include "utils.h"
 #include "libevent-compat.h"
+#include "upstream-tls.h"
+#include "cntlm-embed.h"
+#include <event2/bufferevent_ssl.h>
 
 
 #define REDSOCKS_RELAY_HALFBUFF  4096
@@ -95,6 +97,10 @@ static parser_entry redsocks_entries[] =
 	{ .key = "password",   .type = pt_pchar },
 	{ .key = "listenq",    .type = pt_uint16 },
 	{ .key = "splice",     .type = pt_bool },
+	{ .key = "tls", .type = pt_bool },
+	{ .key = "tls_host", .type = pt_pchar },
+	{ .key = "tls_ca", .type = pt_pchar },
+	{ .key = "cntlm_context", .type = pt_pchar },
 	{ .key = "disclose_src", .type = pt_disclose_src },
 	{ .key = "on_proxy_fail", .type = pt_on_proxy_fail },
 	{ }
@@ -138,6 +144,7 @@ static int redsocks_onenter(parser_section *section)
 	}
 
 	INIT_LIST_HEAD(&instance->list);
+	list_add(&instance->list, &instances);
 	INIT_LIST_HEAD(&instance->clients);
 	instance->config.bindaddr.sin_family = AF_INET;
 	instance->config.bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -161,6 +168,10 @@ static int redsocks_onenter(parser_section *section)
 			(strcmp(entry->key, "login") == 0)      ? (void*)&instance->config.login :
 			(strcmp(entry->key, "password") == 0)   ? (void*)&instance->config.password :
 			(strcmp(entry->key, "listenq") == 0)    ? (void*)&instance->config.listenq :
+			(strcmp(entry->key, "tls") == 0) ? (void*)&instance->config.tls :
+			(strcmp(entry->key, "tls_host") == 0) ? (void*)&instance->config.tls_host :
+			(strcmp(entry->key, "tls_ca") == 0) ? (void*)&instance->config.tls_ca :
+			(strcmp(entry->key, "cntlm_context") == 0) ? (void*)&instance->config.cntlm_context :
 			(strcmp(entry->key, "splice") == 0)     ? (void*)&instance->config.use_splice :
 			(strcmp(entry->key, "disclose_src") == 0) ? (void*)&instance->config.disclose_src :
 			(strcmp(entry->key, "on_proxy_fail") == 0) ? (void*)&instance->config.on_proxy_fail :
@@ -189,7 +200,7 @@ static int redsocks_onexit(parser_section *section)
 		FOREACH(ss, relay_subsystems) {
 			if (!strcmp((*ss)->name, instance->config.type)) {
 				instance->relay_ss = *ss;
-				list_add(&instance->list, &instances);
+
 				break;
 			}
 		}
@@ -200,6 +211,22 @@ static int redsocks_onexit(parser_section *section)
 	}
 	else {
 		parser_error(section->context, "no `type` for redsocks");
+		return -1;
+	}
+
+	if (instance->config.tls || instance->config.cntlm_context)
+		instance->config.use_splice = false; /* before sizeof_client/red_payload */
+	if (instance->config.tls && (!instance->config.tls_host || !*instance->config.tls_host)) {
+		parser_error(section->context, "tls_host is required for upstream TLS");
+		return -1;
+	}
+	if ((instance->config.tls || instance->config.cntlm_context) &&
+	    instance->relay_ss != &http_connect_subsys && instance->relay_ss != &http_relay_subsys) {
+		parser_error(section->context, "TLS/cntlm requires an HTTP relay type");
+		return -1;
+	}
+	if (instance->config.cntlm_context && strcmp(instance->config.cntlm_context, "default")) {
+		parser_error(section->context, "unknown cntlm context");
 		return -1;
 	}
 
@@ -634,16 +661,21 @@ static int redsocks_start_splicepump(redsocks_client *client)
 	evbuffer_unfreeze(client->relay->output, 1);
 
 	redsocks_pump *pump = red_pump(client);
-	if (!error)
-		error = pipe2(&pump->request.read, O_NONBLOCK);
-	if (!error)
-		error = pipe2(&pump->reply.read, O_NONBLOCK);
+	int pipe_fds[2];
+	if (!error) {
+		error = pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC);
+		if (!error) { pump->request.read = pipe_fds[0]; pump->request.write = pipe_fds[1]; }
+	}
+	if (!error) {
+		error = pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC);
+		if (!error) { pump->reply.read = pipe_fds[0]; pump->reply.write = pipe_fds[1]; }
+	}
 	if (error) {
 		redsocks_log_errno(client, LOG_ERR, "pipe2");
 		return error;
 	}
 
-	struct event_base *base = NULL;
+	struct event_base *base = redsocks_event_base();
 	const int relay_fd = bufferevent_getfd(client->relay);
 	const int client_fd = bufferevent_getfd(client->client);
 	if (!error)
@@ -786,7 +818,10 @@ void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int 
 	// we're either going to abort data flow (bad behaviour) or confirm EOF
 	// and in this case socket is already SHUT_RD'ed
 	if ( !(how == SHUT_RD && (*pevshut & EV_WRITE)) ) {
-		if (shutdown(event_get_fd(&buffev->ev_read), how) != 0)
+		if (buffev == client->relay && client->instance->config.tls && how != SHUT_RD)
+			redsocks_tls_close(buffev);
+		else if (!(buffev == client->relay && client->instance->config.tls) &&
+		         shutdown(event_get_fd(&buffev->ev_read), how) != 0)
 			redsocks_log_errno(client, LOG_ERR, "shutdown(%s, %s)", strev, strhow);
 	} else {
 		redsocks_log_error(client, LOG_DEBUG, "ignored shutdown(%s, %s)", strev, strhow);
@@ -995,8 +1030,57 @@ fail:
 	redsocks_drop_client(client);
 }
 
+static void redsocks_tls_connected(struct bufferevent *bev, short what, void *arg)
+{
+	redsocks_client *client = arg;
+	if (!(what & BEV_EVENT_CONNECTED)) {
+		redsocks_engine_error("Upstream TLS handshake or certificate validation failed");
+		redsocks_drop_client(client);
+		return;
+	}
+	bufferevent_set_timeouts(bev, NULL, NULL);
+	bufferevent_setcb(bev, client->instance->relay_ss->readcb,
+		client->instance->relay_ss->writecb, redsocks_event_error, client);
+	client->instance->relay_ss->writecb(bev, client);
+}
+
+void redsocks_cntlm_handoff(redsocks_client *client, const char *authority)
+{
+	int fd = bufferevent_getfd(client->client);
+	size_t length = evbuffer_get_length(client->client->input);
+	const void *prefix = evbuffer_pullup(client->client->input, -1);
+	bufferevent_disable(client->client, EV_READ | EV_WRITE);
+	bufferevent_setfd(client->client, -1);
+	if (cntlm_embed_accept(fd, &client->clientaddr, authority, prefix, length))
+		redsocks_close(fd);
+	redsocks_drop_client(client);
+}
+
 void redsocks_connect_relay(redsocks_client *client)
 {
+	if (client->instance->config.tls) {
+		SSL *ssl = redsocks_tls_session(client->instance->tls_context, client->instance->config.tls_host);
+		int fd = red_socket_client(SOCK_STREAM);
+		if (!ssl || fd < 0) {
+			SSL_free(ssl);
+			if (fd >= 0) redsocks_close(fd);
+			redsocks_drop_client(client);
+			return;
+		}
+		client->relay = bufferevent_openssl_socket_new(redsocks_event_base(), fd, ssl,
+			BUFFEREVENT_SSL_CONNECTING, 0);
+		if (!client->relay) {
+			SSL_free(ssl); redsocks_close(fd); redsocks_drop_client(client); return;
+		}
+		struct timeval deadline = { 10, 0 };
+		bufferevent_set_timeouts(client->relay, &deadline, &deadline);
+		bufferevent_setcb(client->relay, NULL, NULL, redsocks_tls_connected, client);
+		if (bufferevent_socket_connect(client->relay,
+		    (struct sockaddr *)&client->instance->config.relayaddr, sizeof(struct sockaddr_in)) ||
+		    bufferevent_enable(client->relay, EV_READ | EV_WRITE)) redsocks_drop_client(client);
+		return;
+	}
+
 	client->relay = red_connect_relay(&client->instance->config.relayaddr,
 			                          redsocks_relay_connected, redsocks_event_error, client);
 	if (!client->relay) {
@@ -1150,10 +1234,12 @@ void redsocks_bufferevent_dropfd_internal(redsocks_client *client, struct buffer
 void redsocks_bufferevent_free(struct bufferevent *buffev)
 {
 	int fd = bufferevent_getfd(buffev);
+	SSL *ssl = bufferevent_openssl_get_ssl(buffev);
 	if (bufferevent_setfd(buffev, -1)) { // to avoid EBADFD warnings from epoll
 		log_errno(LOG_WARNING, "bufferevent_setfd");
 	}
 	bufferevent_free(buffev);
+	SSL_free(ssl); /* SSL bevs here deliberately do not own the tracked fd. */
 	if (fd != -1)
 		redsocks_close(fd);
 }
@@ -1284,16 +1370,6 @@ fail:
 		redsocks_close(client_fd);
 }
 
-static const char *redsocks_evshut_str(unsigned short evshut)
-{
-	return
-		evshut == EV_READ ? "SHUT_RD" :
-		evshut == EV_WRITE ? "SHUT_WR" :
-		evshut == (EV_READ|EV_WRITE) ? "SHUT_RDWR" :
-		evshut == 0 ? "" :
-		"???";
-}
-
 static const char *redsocks_event_str(unsigned short what)
 {
 	return
@@ -1302,79 +1378,6 @@ static const char *redsocks_event_str(unsigned short what)
 		what == (EV_READ|EV_WRITE) ? "R/W" :
 		what == 0 ? "-/-" :
 		"???";
-}
-
-static uint32_t redsocks_debug_dump_instance(redsocks_instance *instance, struct timeval *now)
-{
-	redsocks_client *client = NULL;
-	uint32_t conn = 0;
-	char bindaddr_str[RED_INET_ADDRSTRLEN];
-
-	log_error(LOG_NOTICE, "Dumping client list for %s at %s:", instance->config.type, red_inet_ntop(&instance->config.bindaddr, bindaddr_str, sizeof(bindaddr_str)));
-	list_for_each_entry(client, &instance->clients, list) {
-		conn++;
-		const char *s_client_evshut = redsocks_evshut_str(client->client_evshut);
-		const char *s_relay_evshut = redsocks_evshut_str(client->relay_evshut);
-		struct timeval age, idle;
-		timersub(now, &client->first_event, &age);
-		timersub(now, &client->last_event, &idle);
-
-		if (!instance->config.use_splice) {
-			redsocks_log_error(client, LOG_NOTICE, "client: %i (%s)%s%s, relay: %i (%s)%s%s, age: %ld.%06ld sec, idle: %ld.%06ld sec.",
-				client->client ? bufferevent_getfd(client->client) : -1,
-				client->client ? redsocks_event_str(client->client->enabled) : "NULL",
-				s_client_evshut[0] ? " " : "",
-				s_client_evshut,
-				client->relay ? bufferevent_getfd(client->relay) : -1,
-				client->relay ? redsocks_event_str(client->relay->enabled) : "NULL",
-				s_relay_evshut[0] ? " " : "",
-				s_relay_evshut,
-				age.tv_sec, age.tv_usec,
-				idle.tv_sec, idle.tv_usec);
-		} else {
-			redsocks_pump *pump = red_pump(client);
-
-			redsocks_log_error(client, LOG_NOTICE, "client: buf %i (%s) splice %i (%s/%s) pipe[%d, %d]=%zu%s%s, relay: buf %i (%s) splice %i (%s/%s) pipe[%d, %d]=%zu%s%s, age: %ld.%06ld sec, idle: %ld.%06ld sec.",
-				client->client ? bufferevent_getfd(client->client) : -1,
-				client->client ? redsocks_event_str(client->client->enabled) : "NULL",
-				event_get_fd(&pump->client_read),
-				event_pending(&pump->client_read, EV_READ, NULL) ? "R" : "-",
-				event_pending(&pump->client_write, EV_WRITE, NULL) ? "W" : "-",
-				pump->request.read,
-				pump->request.write,
-				pump->request.size,
-				s_client_evshut[0] ? " " : "",
-				s_client_evshut,
-
-				client->relay ? bufferevent_getfd(client->relay) : -1,
-				client->relay ? redsocks_event_str(client->relay->enabled) : "NULL",
-				event_get_fd(&pump->relay_read),
-				event_pending(&pump->relay_read, EV_READ, NULL) ? "R" : "-",
-				event_pending(&pump->relay_write, EV_WRITE, NULL) ? "W" : "-",
-				pump->reply.read,
-				pump->reply.write,
-				pump->reply.size,
-				s_relay_evshut[0] ? " " : "",
-				s_relay_evshut,
-
-				age.tv_sec, age.tv_usec,
-				idle.tv_sec, idle.tv_usec);
-		}
-	}
-	log_error(LOG_NOTICE, "End of client list. %d clients.", conn);
-	return conn;
-}
-
-static void redsocks_debug_dump(int sig, short what, void *_arg)
-{
-	redsocks_instance *instance = NULL;
-	struct timeval now;
-	redsocks_gettimeofday(&now);
-	uint32_t conn = 0;
-
-	list_for_each_entry(instance, &instances, list)
-		conn += redsocks_debug_dump_instance(instance, &now);
-	assert(conn == redsocks_conn);
 }
 
 bool redsocks_has_splice_instance()
@@ -1389,6 +1392,20 @@ bool redsocks_has_splice_instance()
 }
 
 static void redsocks_fini_instance(redsocks_instance *instance);
+
+int redsocks_prepare_transports(void)
+{
+    redsocks_instance *instance;
+    list_for_each_entry(instance, &instances, list) {
+        if (instance->config.cntlm_context && !cntlm_embed_enabled()) return -1;
+        if (instance->config.tls) {
+            instance->tls_context = redsocks_tls_context(instance->config.tls_ca);
+            if (!instance->tls_context) return -1;
+        }
+        if (instance->config.cntlm_context && cntlm_embed_tls(instance->config.tls, instance->config.tls_host)) return -1;
+    }
+    return 0;
+}
 
 static int redsocks_init_instance(redsocks_instance *instance)
 {
@@ -1447,7 +1464,7 @@ static void redsocks_fini_instance(redsocks_instance *instance) {
 		}
 	}
 
-	if (instance->relay_ss->instance_fini)
+	if (instance->relay_ss && instance->relay_ss->instance_fini)
 		instance->relay_ss->instance_fini(instance);
 
 	if (event_initialized(&instance->listener)) {
@@ -1462,6 +1479,10 @@ static void redsocks_fini_instance(redsocks_instance *instance) {
 	free(instance->config.type);
 	free(instance->config.login);
 	free(instance->config.password);
+	free(instance->config.tls_host);
+	free(instance->config.tls_ca);
+	free(instance->config.cntlm_context);
+	SSL_CTX_free(instance->tls_context);
 
 	memset(instance, 0, sizeof(*instance));
 	free(instance);
@@ -1469,27 +1490,11 @@ static void redsocks_fini_instance(redsocks_instance *instance) {
 
 static int redsocks_fini();
 
-static struct event debug_dumper;
-
 static int redsocks_init(struct event_base *evbase) {
 	UNUSED(evbase);
-	struct sigaction sa = { }, sa_old = { };
 	redsocks_instance *tmp, *instance = NULL;
-
 	redsocks_conn = 0;
-
-	sa.sa_handler = SIG_IGN;
-	sa.sa_flags = SA_RESTART;
-	if (sigaction(SIGPIPE, &sa, &sa_old) == -1) {
-		log_errno(LOG_ERR, "sigaction");
-		return -1;
-	}
-
-	signal_set(&debug_dumper, SIGUSR1, redsocks_debug_dump, NULL);
-	if (signal_add(&debug_dumper, NULL) != 0) {
-		log_errno(LOG_ERR, "signal_add");
-		goto fail;
-	}
+	accept_backoff_ms = 0;
 
 	event_set(&accept_backoff_ev, -1, 0, redsocks_accept_backoff, NULL);
 
@@ -1501,9 +1506,6 @@ static int redsocks_init(struct event_base *evbase) {
 	return 0;
 
 fail:
-	// that was the first resource allocation, it return's on failure, not goto-fail's
-	sigaction(SIGPIPE, &sa_old, NULL);
-
 	redsocks_fini();
 
 	return -1;
@@ -1517,12 +1519,9 @@ static int redsocks_fini()
 		redsocks_fini_instance(instance);
 
 	assert(redsocks_conn == 0);
-
-	if (signal_initialized(&debug_dumper)) {
-		if (signal_del(&debug_dumper) != 0)
-			log_errno(LOG_WARNING, "signal_del");
-		memset(&debug_dumper, 0, sizeof(debug_dumper));
-	}
+	if (event_initialized(&accept_backoff_ev)) event_del(&accept_backoff_ev);
+	memset(&accept_backoff_ev, 0, sizeof(accept_backoff_ev));
+	accept_backoff_ms = 0;
 
 	return 0;
 }

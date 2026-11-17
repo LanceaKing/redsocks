@@ -497,8 +497,10 @@ int parser_run(parser_context *context)
 					parser_error(context, "file read failure");
 					return -1;
 				}
-				else
-					continue;
+				else if (!context->buffer.filled)
+					break;
+				/* Process the final unterminated line as well. */
+				*sbegin = '\0';
 			}
 			len = strlen(sbegin);
 			context_filled_add(context, +len);
@@ -506,9 +508,19 @@ int parser_run(parser_context *context)
 				context->line++;
 				need_more_data = false;
 			}
-			else {
+			else if (!feof(context->fd)) {
 				need_more_space = true;
 				continue;
+			}
+			else {
+				char *data = realloc(context->buffer.data, context->buffer.filled + 2);
+				if (!data) { parser_error(context, "realloc failure"); break; }
+				context->buffer.data = data;
+				context->buffer.size = context->buffer.filled + 2;
+				data[context->buffer.filled] = '\n';
+				context_filled_add(context, 1);
+				context->line++;
+				need_more_data = false;
 			}
 		}
 
@@ -647,6 +659,9 @@ int parser_run(parser_context *context)
 			need_more_data = true;
 	}
 	// file-error goes is thrown here
+	if (in_comment || (context->buffer.filled &&
+	    strspn(context->buffer.data, " \t\r\n") != context->buffer.filled))
+		parser_error(context, "incomplete token or comment");
 	if (section)
 		parser_error(context, "unclosed section");
 	if (section_token) {
