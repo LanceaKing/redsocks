@@ -161,12 +161,23 @@ def certificates(tmp_path_factory):
     def run(*args):
         subprocess.run(["openssl", *args], cwd=root, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=Engine Test CA", "-keyout", "ca.key", "-out", "ca.pem")
-    for name, sans, days in (("valid", "DNS:proxy.test,DNS:localhost,IP:127.0.0.1", "2"),
-                              ("wrong", "DNS:other.test", "2"),
-                              ("expired", "DNS:proxy.test", "-1")):
+    (root / "index").touch()
+    (root / "serial").write_text("1000\n")
+    (root / "ca.cnf").write_text(
+        "[ca]\ndefault_ca=test\n[test]\ndatabase=index\nnew_certs_dir=.\n"
+        "serial=serial\ncertificate=ca.pem\nprivate_key=ca.key\n"
+        "default_md=sha256\ndefault_days=2\npolicy=names\n[names]\ncommonName=supplied\n")
+    for name, sans in (("valid", "DNS:proxy.test,DNS:localhost,IP:127.0.0.1"),
+                       ("wrong", "DNS:other.test"), ("expired", "DNS:proxy.test")):
         run("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN="+name, "-keyout", name+".key", "-out", name+".csr")
         (root / "extensions").write_text("subjectAltName="+sans+"\nextendedKeyUsage=serverAuth\n")
-        run("x509", "-req", "-in", name+".csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", days, "-extfile", "extensions", "-out", name+".pem")
+        if name == "expired":
+            # Fixed past dates work with OpenSSL versions that reject -days -1.
+            run("ca", "-batch", "-notext", "-config", "ca.cnf", "-in", name+".csr",
+                "-startdate", "20000101000000Z", "-enddate", "20000102000000Z",
+                "-extfile", "extensions", "-out", name+".pem")
+        else:
+            run("x509", "-req", "-in", name+".csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "2", "-extfile", "extensions", "-out", name+".pem")
     return root
 
 
@@ -228,7 +239,8 @@ def test_hash_vectors(library):
 
 
 @pytest.mark.parametrize("host", ["proxy.test", "127.0.0.1"])
-def test_upstream_tls_sni_ip_and_buffered_payload(library, tmp_path, certificates, host):
+@pytest.mark.parametrize("version", [ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3])
+def test_upstream_tls_sni_ip_and_buffered_payload(library, tmp_path, certificates, host, version):
     port = unused_port(); payload = hello("target.test") + bytes(range(256))*1024
     def upstream(conn, i):
         line, h = headers(conn)
@@ -237,13 +249,72 @@ def test_upstream_tls_sni_ip_and_buffered_payload(library, tmp_path, certificate
         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         assert receive_exact(conn, len(payload)) == payload
         conn.sendall(b"echo:"+payload)
-    with Server(upstream, tls_context(certificates)) as server:
+    context = tls_context(certificates)
+    context.minimum_version = context.maximum_version = version
+    with Server(upstream, context) as server:
         with Engine(library, tmp_path, config(port, server.port, tls=True, host=host,
                     extra='login = "u"; password = "p";'), trust=(certificates / "ca.pem").read_bytes()):
             with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
                 client.sendall(payload)
                 assert receive_exact(client, len(payload)+5) == b"echo:"+payload
-        assert server.sni == ["proxy.test" if host == "proxy.test" else None]
+        # TLS 1.3 can send a second ClientHello after HelloRetryRequest.
+        # Every ClientHello must retain the same DNS SNI (or omit IP SNI).
+        assert 1 <= len(server.sni) <= (2 if version == ssl.TLSVersion.TLSv1_3 else 1)
+        assert all(name == ("proxy.test" if host == "proxy.test" else None) for name in server.sni)
+
+
+@pytest.mark.parametrize("version", [ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3])
+@pytest.mark.parametrize("cntlm", [False, True])
+def test_tls_close_notify_drains_buffered_response(library, tmp_path, certificates, version, cntlm):
+    port = unused_port()
+    request = hello("target.test")
+    response = bytes(range(256)) * 1024 + b"final-byte"
+    ready, release = threading.Event(), threading.Event()
+    def upstream(conn, i):
+        if cntlm:
+            ntlm_step(conn, "NTLMv2")
+        else:
+            headers(conn)
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        assert receive_exact(conn, len(request)) == request
+        ready.set()
+        assert release.wait(3)
+        conn.sendall(response)
+        # Send an authenticated EOF while the local client is backpressured.
+        conn.unwrap().close()
+    context = tls_context(certificates)
+    context.minimum_version = context.maximum_version = version
+    with Server(upstream, context) as server:
+        with Engine(library, tmp_path, config(port, server.port, tls=True, cntlm=cntlm),
+                    credentials(server.port) if cntlm else None,
+                    trust=(certificates / "ca.pem").read_bytes()) as engine:
+            with socket.socket() as client:
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                client.settimeout(5)
+                client.connect(("127.0.0.1", port))
+                client.sendall(request)
+                client.shutdown(socket.SHUT_WR)
+                assert ready.wait(3)
+                # Constrain the accepted engine socket as well as the reader,
+                # so the response cannot drain into a large kernel send queue.
+                for name in os.listdir('/proc/self/fd'):
+                    try:
+                        with socket.fromfd(int(name), socket.AF_INET, socket.SOCK_STREAM) as accepted:
+                            if (accepted.getsockname() == ('127.0.0.1', port) and
+                                    accepted.getpeername() == client.getsockname()):
+                                accepted.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                                break
+                    except OSError:
+                        pass
+                else:
+                    pytest.fail('engine client socket not found')
+                release.set()
+                time.sleep(.1)
+                assert receive_exact(client, len(response)) == response
+                assert client.recv(1) == b""
+            began = time.monotonic()
+            assert engine.stop() == 0
+            assert time.monotonic() - began < 1.5
 
 
 @pytest.mark.parametrize("failure", ["wrong", "expired", "untrusted"])

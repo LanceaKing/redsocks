@@ -174,7 +174,7 @@ static int dnstc_init_instance(dnstc_instance *instance)
 		goto fail;
 	}
 
-	event_set(&instance->listener, fd, EV_READ | EV_PERSIST, dnstc_pkt_from_client, instance);
+	event_assign(&instance->listener, redsocks_event_base(), fd, EV_READ | EV_PERSIST, dnstc_pkt_from_client, instance);
 	error = event_add(&instance->listener, NULL);
 	if (error) {
 		log_errno(LOG_ERR, "event_add");

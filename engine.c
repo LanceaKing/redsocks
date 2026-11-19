@@ -4,6 +4,7 @@
 #include "main.h"
 #include "log.h"
 #include "base.h"
+#include "event-cleanup.h"
 #include <event2/event.h>
 #include <openssl/opensslv.h>
 #include <pthread.h>
@@ -16,9 +17,19 @@
 #include <stdio.h>
 #include <sys/socket.h>
 
-extern app_subsys base_subsys, redsocks_subsys, redudp_subsys, dnstc_subsys, dnsu2t_subsys;
+extern app_subsys base_subsys, redsocks_subsys, dnstc_subsys;
+#ifdef __linux__
+extern app_subsys redudp_subsys, dnsu2t_subsys;
+#endif
 static app_subsys *subsystems[] = { &base_subsys, &redsocks_subsys,
-    &redudp_subsys, &dnstc_subsys, &dnsu2t_subsys };
+#ifdef __linux__
+    &redudp_subsys,
+#endif
+    &dnstc_subsys,
+#ifdef __linux__
+    &dnsu2t_subsys,
+#endif
+};
 struct redsocks_engine {
     pthread_mutex_t mutex;
     pthread_cond_t changed;
@@ -132,7 +143,10 @@ cleanup:
         }
     }
     if (wake) event_free(wake);
-    if (e->base) event_base_free(e->base);
+    if (e->base && redsocks_event_base_free(e->base)) {
+        redsocks_engine_error("Native event cleanup failed");
+        e->result = -1;
+    }
     e->base = NULL;
     redsocks_log_reset();
     close_options(e);
@@ -246,6 +260,11 @@ int redsocks_engine_detect(redsocks_engine *e, const redsocks_engine_options *o,
     e->detect_url = NULL; e->detect_output = NULL;
     return result;
 }
+#ifdef PROXYDROID_TLS_CONFIGURED
+#include "tls-build-info.h"
+#else
+#define PROXYDROID_TLS_BUILD_INFO OPENSSL_VERSION_TEXT
+#endif
 const char *redsocks_engine_build_info(void) {
-    return "redsocks shared engine; cntlm " REDSOCKS_CNTLM_VERSION "; " OPENSSL_VERSION_TEXT "; libevent " LIBEVENT_VERSION;
+    return "redsocks shared engine; cntlm " REDSOCKS_CNTLM_VERSION "; " PROXYDROID_TLS_BUILD_INFO "; libevent " LIBEVENT_VERSION;
 }

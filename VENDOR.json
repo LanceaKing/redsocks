@@ -1,0 +1,9 @@
+{
+  "name": "redsocks",
+  "version": "0.5-http-connect-sni",
+  "upstream": "https://github.com/darkk/redsocks",
+  "fork": "https://github.com/LanceaKing/redsocks",
+  "upstream_commit": "19b822e345f6a291f6cff6b168f1cfdfeeb2cd7d",
+  "imported_commit": "2c529af7f8e7be41c2888a2048c737af313251af",
+  "notes": "Tracks the latest darkk/redsocks upstream commit checked 2026-11-19. Retained changes implement the shared C/JNI engine, CONNECT SNI, verified upstream TLS and embedded cntlm, public libevent 2.x APIs, minimum Android API/macOS portability, and regression-backed stream/lifecycle cleanup. cntlm is a separately pinned sibling dependency. See README.md and docs/embedding.md; upstream libraries are not patched at build time."
+}

@@ -173,7 +173,7 @@ ssize_t cntlm_io_write(int fd, const void *data, size_t length) {
 ssize_t cntlm_io_recv(int fd, void *out, size_t length, int flags) {
     stream *s = lookup(fd);
     if (!s) return recv(fd, out, length, flags);
-    event_base_loop(s->base, EVLOOP_NONBLOCK);
+    event_base_loop(s->base, EVLOOP_NONBLOCK | EVLOOP_ONCE);
     struct evbuffer *in = bufferevent_get_input(s->bev);
     if (!evbuffer_get_length(in)) {
         if (s->ended || is_stopping()) return 0;
@@ -190,7 +190,7 @@ ssize_t cntlm_io_send(int fd, const void *data, size_t length, int flags) {
 int cntlm_io_closed(int fd) {
     stream *s = lookup(fd);
     if (!s) return fd < 0;
-    event_base_loop(s->base, EVLOOP_NONBLOCK);
+    event_base_loop(s->base, EVLOOP_NONBLOCK | EVLOOP_ONCE);
     return (s->ended && !evbuffer_get_length(bufferevent_get_input(s->bev))) || is_stopping();
 }
 int cntlm_io_shutdown(int fd, int how) {
@@ -260,7 +260,10 @@ int cntlm_io_select(int n, fd_set *reads, fd_set *writes, fd_set *errors, struct
             stream *s = lookup(fd);
             if (s) {
                 s->owner = pthread_self();
-                event_base_loop(s->base, EVLOOP_NONBLOCK);
+                /* A nonblocking loop can keep dispatching an always-ready
+                 * TLS socket. Yield after one iteration so buffered data and
+                 * the engine's stop flag are observed between dispatches. */
+                event_base_loop(s->base, EVLOOP_NONBLOCK | EVLOOP_ONCE);
                 if (reads && FD_ISSET(fd, &wanted_r) && (s->ended || evbuffer_get_length(bufferevent_get_input(s->bev)))) {
                     FD_SET(fd, reads); ++ready;
                 }

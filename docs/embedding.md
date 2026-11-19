@@ -1,16 +1,24 @@
 # Shared redsocks engine
 
-Initialize the pinned cntlm fork and build on Linux:
+ProxyDroid initializes this repository and cntlm as sibling submodules with
+`git submodule update --init --recursive` from its root. For a standalone Linux
+checkout, obtain cntlm beside redsocks and build:
 
 ```sh
-git submodule update --init --recursive
+git clone --no-checkout https://github.com/LanceaKing/cntlm.git ../cntlm
+git -C ../cntlm checkout --detach dc03f47e1e775f73be5c781d079b7efceadff3b5
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j4
 ```
 
-The build needs CMake 3.22.1+, a C compiler, libevent with OpenSSL support,
+The build needs CMake 3.22.1+, a C compiler, libevent >= 2.1.1 with OpenSSL support,
 OpenSSL development headers, and pthreads. Android builds supply their pinned
-static libevent/OpenSSL targets from ProxyDroid's parent CMake project.
+static `event_core`, `event_openssl` and TLS targets from ProxyDroid's parent
+CMake project. The parent configures `TLS_BACKEND=openssl` once; libevent, the
+native TLS transport and cntlm's host I/O all use those same OpenSSL libraries.
+The integration uses public bufferevent getters/setters, including watermarks,
+callbacks and descriptors, without libevent source patches. Standalone
+callers may set `-DCNTLM_SOURCE_DIR=/absolute/path/cntlm` for another location.
 
 ## C caller
 
@@ -65,6 +73,13 @@ context may run in a process. The host must stop/join before destroying the
 handle. The library does not daemonize, fork, call exit, alter uid/chroot,
 register process signal handlers, or change process-wide file limits.
 
+Shutdown disables and frees application I/O before draining pending deferred
+bufferevent references without blocking. The event base is freed only after
+that drain, so stopping between an I/O event and its deferred callback releases
+the connection's buffers and sockets as well.
+Each connection direction is half-closed only once, including when deferred
+callbacks repeat after EOF, so TLS response records remain available to read.
+
 `redsocks_engine_validate` checks configuration without binding listeners.
 `redsocks_engine_hashes` returns explicit caller-requested LM/NT/NTLMv2 hashes.
 `redsocks_engine_detect` runs the dialect probes in an isolated engine context;
@@ -113,7 +128,7 @@ services use the same transport/authentication context. Windows SSPI and
 platform GSS/Kerberos are not enabled in this Android portable target. Process
 controls such as User/PidFile/daemonization are rejected by the embedding host.
 The fork's interface and focused unit tests are documented in
-[../cntlm/EMBEDDING.md](../cntlm/EMBEDDING.md).
+[cntlm/EMBEDDING.md](../../cntlm/EMBEDDING.md).
 
 ```sh
 build/redsocks -c redsocks.conf -n cntlm.conf -C trust.pem -t

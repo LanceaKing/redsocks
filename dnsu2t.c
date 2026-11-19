@@ -121,8 +121,8 @@ static void dnsu2t_pkt_from_client(int srvfd, short what, void *_arg)
 		if (fd < 0)
 			goto fail;
 
-		event_set(&self->relay_rd, fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_relay, self);
-		event_set(&self->relay_wr, fd, EV_WRITE, dnsu2t_relay_writable, self);
+		event_assign(&self->relay_rd, redsocks_event_base(), fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_relay, self);
+		event_assign(&self->relay_wr, redsocks_event_base(), fd, EV_WRITE, dnsu2t_relay_writable, self);
 		fd = -1;
 
 		// The timeout on a persistent event resets whenever the event's callback runs.
@@ -384,7 +384,7 @@ static int dnsu2t_init_instance(dnsu2t_instance *instance)
 		goto fail;
 	}
 
-	event_set(&instance->listener, fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_client, instance);
+	event_assign(&instance->listener, redsocks_event_base(), fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_client, instance);
 	error = event_add(&instance->listener, NULL);
 	if (error) {
 		log_errno(LOG_ERR, "event_add");

@@ -1,4 +1,0 @@
-[submodule "cntlm"]
-	path = cntlm
-	url = https://github.com/LanceaKing/cntlm.git
-	branch = feat/redsocks-embedded

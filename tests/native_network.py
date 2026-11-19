@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -56,7 +57,8 @@ class VM:
         return self.process.pid
 
     def exec_cmd(self, command):
-        return ['ip', 'netns', 'exec', self.namespace, *shlex.split(command)]
+        return ['taskset', '--cpu-list', ','.join(map(str, self.network.cpus)),
+                'ip', 'netns', 'exec', self.namespace, *shlex.split(command)]
 
     def do(self, command):
         env = dict(os.environ, NO_PROXY='*', no_proxy='*')
@@ -139,11 +141,15 @@ class Network:
         if os.geteuid() != 0:
             raise RuntimeError('Network tests need root: sudo -E tests/run')
         for program in ('ip', 'iptables', 'tc', 'ss', 'curl', 'nc', 'nginx',
-                        'squid', 'danted', 'xinetd', 'useradd', 'userdel', 'chpasswd'):
+                        'squid', 'danted', 'xinetd', 'useradd', 'userdel', 'chpasswd', 'taskset'):
             if not shutil.which(program):
                 raise RuntimeError('Missing native test dependency: ' + program)
         self.binary = binary
         self.prlimit = prlimit
+        # Qdisc watchdogs run on the CPUs that enqueue their packets. Cover
+        # the caller's complete CPU mask without serializing concurrent curl.
+        self.cpus = sorted(os.sched_getaffinity(0))
+        self.timing_pulses = []
         # Squid's unprivileged helpers must be able to traverse every parent.
         # Hosted runners may keep their workspace below a private home directory.
         self.work = Path(tempfile.mkdtemp(prefix='redsocks-tests-')).resolve()
@@ -192,7 +198,13 @@ worker_processes 1;
 pid %s/nginx.pid;
 error_log %s/nginx-error.log notice;
 events { worker_connections 128; }
-http { access_log off; server { listen 80; root %s; } }
+http {
+    access_log off;
+    server {
+        listen 80;
+        root %s;
+    }
+}
 ''' % (self.work, self.work, www))
         web.start('nginx -c %s -g "daemon off;"' % shlex.quote(str(nginx_conf)), [80])
 
@@ -232,7 +244,10 @@ pinger_enable off
         account = 'rsocktest%d' % os.getpid()
         run(['useradd', '--system', '--no-create-home', '--shell', '/usr/sbin/nologin', account])
         self.account = account
-        subprocess.run(['chpasswd'], input=account + ':sockpwd\n', text=True, check=True)
+        # These public, temporary credentials test SOCKS authentication and
+        # network round trips. Do not inherit a host-specific password KDF cost.
+        subprocess.run(['chpasswd', '--crypt-method', 'SHA256', '--sha-rounds', '1000'],
+                       input=account + ':sockpwd\n', text=True, check=True)
         for number in (0, 1):
             proxy = VM(self, 'dante-%d' % number)
             proxy.connect('web', '10.0.1.%d' % (180 + number), 'ethw', '10.0.1.1')
@@ -261,6 +276,55 @@ pinger_enable off
             tank = VM(self, 'tank%d' % number)
             tank.connect('tank', '10.0.2.%d' % number, 'etht', '10.0.2.123')
 
+    def start_timing_pulses(self):
+        assert not self.timing_pulses
+        binary = self.binary.parent / 'redsocks-test-pulse'
+        if not binary.is_file():
+            raise RuntimeError('Missing %s; build the Linux CMake targets with BUILD_TESTING=ON' % binary)
+        self.timing_pulse_log = (self.work / 'timing-pulse.log').open('a')
+        try:
+            for cpu in self.cpus:
+                process = subprocess.Popen(
+                    self.vm['gw'].exec_cmd(shlex.join(['taskset', '--cpu-list', str(cpu), str(binary)])),
+                    stdout=subprocess.PIPE, stderr=self.timing_pulse_log, text=True)
+                self.timing_pulses.append(process)
+                ready, _, _ = select.select([process.stdout], [], [], 5)
+                if not ready or process.stdout.readline() != 'ready\n':
+                    raise RuntimeError('Timing pulse failed to start:\n' +
+                                       (self.work / 'timing-pulse.log').read_text())
+                assert os.sched_getaffinity(process.pid) == {cpu}
+                assert os.sched_getscheduler(process.pid) == os.SCHED_FIFO
+                assert os.sched_getparam(process.pid).sched_priority == 1
+        except BaseException:
+            for process in self.timing_pulses:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+                process.stdout.close()
+            self.timing_pulse_log.close()
+            self.timing_pulses = []
+            raise
+
+    def stop_timing_pulses(self):
+        processes, self.timing_pulses = self.timing_pulses, []
+        if not processes:
+            return
+        for process in processes:
+            process.terminate()
+        errors = []
+        for process in processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                errors.append(str(error))
+                process.kill()
+                process.wait(timeout=5)
+            process.stdout.close()
+            if process.returncode:
+                errors.append('Timing pulse exited %d' % process.returncode)
+        self.timing_pulse_log.close()
+        assert not errors, (errors, (self.work / 'timing-pulse.log').read_text())
+
     def close(self):
         failures = []
         ordered = sorted(self.vm.values(), key=lambda vm: vm.name != 'regw')
@@ -280,6 +344,10 @@ pinger_enable off
                     assert 'Sanitizer' not in log, log
             except BaseException as error:
                 failures.append(error)
+        try:
+            self.stop_timing_pulses()
+        except BaseException as error:
+            failures.append(error)
         for namespace in reversed(self.namespaces):
             try:
                 for pid in run(['ip', 'netns', 'pids', namespace]).split():

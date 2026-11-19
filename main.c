@@ -1,4 +1,4 @@
-/* Linux regression CLI: lifecycle and forwarding are the shared library's. */
+/* Native regression CLI: lifecycle and forwarding are the shared library's. */
 #include "engine.h"
 #include "version.h"
 #include <signal.h>
@@ -9,6 +9,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+static int wait_signal(const sigset_t *signals, const struct timespec *interval) {
+#ifdef __APPLE__
+    /* Darwin has sigwait but no sigtimedwait. Only this thread consumes the
+     * blocked CLI signals, so a pending signal can be waited for immediately. */
+    sigset_t pending;
+    if (sigpending(&pending)) return -1;
+    for (int signum = 1; signum < NSIG; ++signum) {
+        if (sigismember(signals, signum) == 1 && sigismember(&pending, signum) == 1) {
+            sigset_t one;
+            sigemptyset(&one); sigaddset(&one, signum);
+            int received;
+            return sigwait(&one, &received) ? -1 : received;
+        }
+    }
+    nanosleep(interval, NULL);
+    return -1;
+#else
+    return sigtimedwait(signals, NULL, interval);
+#endif
+}
+
 int main(int argc, char **argv) {
     const char *config = "redsocks.conf", *pidfile = NULL, *cntlm = NULL, *trust = NULL, *detect = NULL;
     int test = 0, hashes = 0, opt;
@@ -63,7 +85,7 @@ int main(int argc, char **argv) {
         if (pidfile) { FILE *f = fopen(pidfile, "w"); if (!f) result = -1; else { fprintf(f, "%d\n", getpid()); fclose(f); } }
         while (!result && redsocks_engine_get_status(engine) == REDSOCKS_RUNNING) {
             struct timespec interval = { 0, 200000000 };
-            int sig = sigtimedwait(&signals, NULL, &interval);
+            int sig = wait_signal(&signals, &interval);
             if (sig == SIGTERM || sig == SIGINT) break;
         }
         redsocks_engine_request_stop(engine);

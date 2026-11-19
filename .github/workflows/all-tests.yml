@@ -12,7 +12,7 @@ jobs:
   native-tests:
     name: Ubuntu / ${{ matrix.compiler }} / ASan + UBSan
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +24,7 @@ jobs:
       PYTHONHASHSEED: "0"
       PYTHON: /usr/bin/python3
       CFLAGS: -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
-      LDFLAGS: -fsanitize=address,undefined
+      LDFLAGS: ${{ matrix.compiler == 'clang' && '-fsanitize=address,undefined --rtlib=compiler-rt --unwindlib=libgcc' || '-fsanitize=address,undefined' }}
       REDSOCKS_BINARY: ${{ github.workspace }}/build/redsocks
       REDSOCKS_PRLIMIT: ${{ github.workspace }}/build/prlimit-nofile
       REDSOCKS_TEST_LOG_DIR: ${{ github.workspace }}/test-results/network
@@ -33,21 +33,29 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          submodules: recursive
+
+      - name: Check out the pinned cntlm sibling dependency
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: LanceaKing/cntlm
+          ref: dc03f47e1e775f73be5c781d079b7efceadff3b5
+          path: .deps/cntlm
+          persist-credentials: false
 
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang libclang-rt-dev llvm cmake ninja-build libevent-dev libssl-dev \
-            python3 python3-pytest iproute2 iptables curl netcat-openbsd \
+            python3 python3-pytest iproute2 iptables util-linux curl netcat-openbsd \
             nginx-light squid dante-server xinetd
 
       - name: Build redsocks with sanitizers
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_FLAGS="$CFLAGS" -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
-            -DCMAKE_SHARED_LINKER_FLAGS="$LDFLAGS" -DCNTLM_BUILD_TESTS=OFF
+            -DCMAKE_SHARED_LINKER_FLAGS="$LDFLAGS" -DCNTLM_BUILD_TESTS=OFF \
+            -DCNTLM_SOURCE_DIR="$PWD/.deps/cntlm"
           cmake --build build
           "$CC" -std=c99 -D_GNU_SOURCE -Wall tests/prlimit-nofile.c -o build/prlimit-nofile
 

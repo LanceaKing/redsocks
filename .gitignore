@@ -5,6 +5,7 @@ redsocks
 .depend
 /gen
 /build/
+/.deps/
 __pycache__/
 /test-results/
 /tests/prlimit-nofile

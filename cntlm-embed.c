@@ -1,5 +1,5 @@
 /* Embedded orchestration of the complete upstream cntlm protocol modules.
- * cntlm is GPL-2.0-or-later; see cntlm/COPYRIGHT and LICENSE. */
+ * cntlm is GPL-2.0-or-later; see ../cntlm/COPYRIGHT and LICENSE. */
 #include <event2/event.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
@@ -267,9 +267,8 @@ int cntlm_embed_init(int fd, struct event_base *base, int bind_ports) {
         config_close(cf); OPENSSL_cleanse(password, sizeof(password));
         failure_target = NULL; return -1;
     }
-    char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
     lseek(fd, 0, SEEK_SET);
-    cf = config_open(path);
+    cf = config_open_fd(fd);
     if (!cf) goto fail;
     g_creds = new_auth();
     if (!g_creds) goto fail;
