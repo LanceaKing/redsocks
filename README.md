@@ -1,5 +1,26 @@
 # redsocks – transparent TCP-to-proxy redirector
 
+## Shared engine, upstream TLS and cntlm
+
+This integration is maintained on `master`.
+ProxyDroid consumes this fork as a pinned Git submodule.
+The patched cntlm fork is a sibling at `../cntlm/`, based on upstream
+master `678d30b8ab4b0b2e3fb89a43bbeedd42d385e5f7` (version 0.94.1).
+CMake compiles it directly; no build-time source patching is involved.
+
+CMake builds `libredsocks.so` and a thin Linux CLI using the same core. The
+embedding API owns an explicit event base, worker lifecycle, configuration
+validation and diagnostics. HTTPS upstreams support TLS 1.2+, SNI and mandatory
+certificate/hostname verification. TLS traffic always uses buffered I/O.
+Cntlm authentication, failover and cached sockets use that same TLS stream.
+The host never starts a second proxy process or loopback authentication bridge.
+
+See [docs/embedding.md](docs/embedding.md) for complete C and CLI examples,
+configuration options, cntlm capabilities and focused regression commands.
+The original redsocks sources retain their Apache-2.0 license; the cntlm
+dependency is GPL-2.0-or-later. See each project's license files when distributing
+a combined build.
+
 ## HTTP CONNECT with TLS SNI (LanceaKing fork)
 
 This fork is based on `darkk/redsocks` master, commit
@@ -43,20 +64,28 @@ and failures are also logged when informational logging is off. These messages
 never contain credentials, authentication challenges, or ClientHello contents.
 
 The original Linux Makefile remains supported. CMake can also build standalone
-against installed libevent, or be embedded with `add_subdirectory(redsocks)`
-after an existing `event` target. CMake generates the configuration and embeds
-the source commit in `redsocks -v`, including when `.git` is a submodule file.
+against installed libevent >= 2.1.1 with its OpenSSL transport, or be embedded
+with `add_subdirectory(redsocks)` after the parent's `event_core` and
+`event_openssl` targets. `TLS_BACKEND=openssl` matches libevent 2.1.13-stable's
+native TLS choice; unsupported choices fail. Every TLS connection, including
+cntlm traffic, uses the same selected OpenSSL targets. CMake generates the configuration and embeds
+the imported revision and directory content digest in `redsocks -v`.
 
 Every test uses the same pytest framework and `tests/run` entry point. This
 includes the C parser checks (compiled and executed by pytest), the parameterized
 loopback CONNECT cases for both pumps, and the original upstream integration
 suite. The parser uses `CC`, `CPPFLAGS`, `CFLAGS` and `LDFLAGS` from the environment.
 
-The `All tests` GitHub Actions workflow invokes `tests/run` once per native
-Ubuntu 24.04 compiler job, with GCC or Clang, ASan and UBSan. All tests share
+The `Redsocks native tests` GitHub Actions workflow invokes `tests/run` once per
+native Ubuntu 24.04 compiler job, with GCC or Clang, ASan and UBSan. All tests share
 one test step and one JUnit report. The workflow runs for pushes and pull
 requests and supports manual dispatch. It uses no Docker, service containers,
 real proxy credentials, or secrets.
+
+This workflow owns redsocks protocol and shared-engine integration coverage,
+including its cntlm transport adapter. Standalone cntlm core/PAC regressions
+run in cntlm's own repository; Android builds and JNI/APK validation run in
+ProxyDroid's repository.
 
 The upstream suite now uses Python 3 and Linux network namespaces. It preserves
 the original three-subnet topology and real nginx, Squid Basic/Digest, Dante
@@ -71,8 +100,8 @@ To run the complete suite on an Ubuntu host without Docker:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-rt-dev libevent-dev \
-  python3 python3-pytest iproute2 iptables curl netcat-openbsd \
+sudo apt-get install -y build-essential clang libclang-rt-dev llvm cmake libevent-dev libssl-dev \
+  python3 python3-pytest iproute2 iptables util-linux curl netcat-openbsd \
   nginx-light squid dante-server xinetd
 tests/build
 tests/run
@@ -83,9 +112,52 @@ point. `tests/run` invokes pytest over all tests and uses sudo for the namespace
 fixtures. For a CMake binary, set `REDSOCKS_BINARY` to its absolute path and
 `REDSOCKS_PRLIMIT` to the compiled `tests/prlimit-nofile` helper. The latency
 assertions use milliseconds consistently, and the nonce concurrency assertion
-converts wall-clock seconds to milliseconds. Network timeouts and FD pressure
+converts monotonic elapsed seconds to milliseconds. Network timeouts and FD pressure
 make the full suite take several minutes. These tests do not replace live
 upstream/application acceptance.
+
+The temporary Dante account uses a fixed-cost SHA-256 password hash. RTT tests
+measure local service costs before shaping. Each measured proxy batch runs
+alongside stock curl through the same Squid or Dante process, with the same
+round-trip count and concurrency (five requests for nonce reuse). The reference
+uses preemptive Basic, cached-Digest's single CONNECT through Squid's open port,
+or the corresponding SOCKS5 negotiation. Curl verifies a single connection and
+successful CONNECT where applicable. This accounts for upstream scheduling
+pauses without counting an additional redsocks protocol exchange as overhead.
+An independent direct HTTP control keeps its original two-RTT absolute bounds;
+proxy paths keep the original ±40 ms tolerance and three/four/five RTT counts.
+Baselines, controls and individual samples are recorded in JUnit output.
+Timing batches wait for the original FD baseline before starting the next
+measurement and before removing netem. This preserves the eight-connection
+limit without counting a previous request's FIN drain or accept backoff as
+protocol latency. These waits are outside the measured request interval.
+
+Topology commands and their child services retain the caller's complete
+allowed CPU affinity mask. While netem is installed, one `redsocks-test-pulse`
+per allowed CPU uses a 1 ms monotonic timerfd and SCHED_FIFO priority 1. It blocks
+between ticks, keeping virtual CPU wakeups and runnable clients responsive during the
+strict RTT checks. This Linux-only test helper requires CAP_SYS_NICE, exits
+after shaping is removed, and is killed if its parent exits. Its CPU usage and
+missed ticks are retained in `timing-pulse.log`. Direct curl samples and their
+medians are recorded before assertions, including failed calibrations. The
+360–440 ms direct HTTP bound, 160–240 ms network connect bound, local connect
+under 5 ms, and proxy ±40 ms tolerance remain unchanged.
+
+Rejected-authentication and refused-target checks require HTTP status 000 and
+zero response bytes. A zero-response FIN (curl 52) or an explicit peer-reset
+(curl 56) is a rejection; other receive errors and unexpected timeouts fail.
+Curl diagnostics are archived, and connections must return to the idle FD
+baseline. The client deadline remains 0.5 seconds.
+
+The native `redsocks-deferred-free` regression stops the event loop before
+queued read callbacks run, then checks that shutdown releases every allocation
+and socket without invoking freed application callbacks. It covers 32 pending
+callbacks as well as ordinary frees from immediate and deferred callbacks.
+
+Half-close is idempotent for each direction. Repeated deferred write callbacks
+cannot restart TLS shutdown while response records remain unread. The native
+`redsocks-tls-half-close` regression queues a real TLS response before two write
+EOFs and requires the complete response and authenticated EOF in TLS 1.2/1.3.
 
 For a focused local check, use pytest selection with the same framework. The
 portable parser and loopback CONNECT cases do not need root or external network
@@ -169,7 +241,7 @@ proxy server.
 
 Login/password authentication is supported for Socks5/HTTPS connections.
 Socks4 supports only username, password is ignored. for HTTPS, currently
-only Basic and Digest scheme is supported.
+Basic, Digest and embedded cntlm NTLM dialects are supported.
 
 Redirect UDP packets via Socks5 proxy server. NB: UDP still goes via UDP, so
 you can't relay UDP via OpenSSH.
@@ -238,7 +310,8 @@ AKA @semigodking who is actively maintaining the fork with GFW in mind.
 
 ## License
 
-All source code is licensed under Apache 2.0 license.
+The original redsocks source code is licensed under Apache 2.0; the optional
+combined cntlm build also includes GPL-2.0-or-later sources from `../cntlm/`.
 You can get a copy at http://www.apache.org/licenses/LICENSE-2.0.html
 
 ## Packages
@@ -251,7 +324,7 @@ You can get a copy at http://www.apache.org/licenses/LICENSE-2.0.html
 
 ## Compilation
 
-[libevent-2.0.x](http://libevent.org/) is required.
+[libevent >= 2.1.1 with OpenSSL support](http://libevent.org/) is required.
 
 gcc and clang are supported right now, other compilers can be used
 but may require some code changes.
@@ -269,8 +342,9 @@ Program has following command-line options:
 * `-p` set a file to write the getpid() into
 
 Following signals are understood:
-SIGUSR1 dumps list of connected clients to log,
-SIGTERM and SIGINT terminates daemon, all active connections are closed.
+The Linux CLI handles SIGTERM and SIGINT by stopping the shared engine and
+closing active connections. The embedded library does not install process
+signal handlers or daemonize.
 
 You can see configuration file example in [redsocks.conf.example](https://github.com/darkk/redsocks/blob/master/redsocks.conf.example).
 

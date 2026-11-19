@@ -323,7 +323,7 @@ static void redudp_read_assoc_reply(struct bufferevent *buffev, void *_arg)
 {
 	redudp_client *client = _arg;
 	redudp_expected_assoc_reply reply;
-	int read = evbuffer_remove(buffev->input, &reply, sizeof(reply));
+	int read = evbuffer_remove(bufferevent_get_input(buffev), &reply, sizeof(reply));
 	int fd = -1;
 	int error;
 	redudp_log_error(client, LOG_DEBUG, "<trace>");
@@ -367,7 +367,7 @@ static void redudp_read_assoc_reply(struct bufferevent *buffev, void *_arg)
 		goto fail;
 	}
 
-	event_set(&client->udprelay, fd, EV_READ | EV_PERSIST, redudp_pkt_from_socks, client);
+	event_assign(&client->udprelay, redsocks_event_base(), fd, EV_READ | EV_PERSIST, redudp_pkt_from_socks, client);
 	error = event_add(&client->udprelay, NULL);
 	if (error) {
 		redudp_log_errno(client, LOG_ERR, "event_add");
@@ -389,7 +389,7 @@ static void redudp_read_auth_reply(struct bufferevent *buffev, void *_arg)
 {
 	redudp_client *client = _arg;
 	socks5_auth_reply reply;
-	int read = evbuffer_remove(buffev->input, &reply, sizeof(reply));
+	int read = evbuffer_remove(bufferevent_get_input(buffev), &reply, sizeof(reply));
 	int error;
 	redudp_log_error(client, LOG_DEBUG, "<trace>");
 
@@ -411,7 +411,7 @@ static void redudp_read_auth_reply(struct bufferevent *buffev, void *_arg)
 	if (error)
 		goto fail;
 
-	client->relay->readcb = redudp_read_assoc_reply;
+	red_bufferevent_set_readcb(client->relay, redudp_read_assoc_reply);
 
 	return;
 
@@ -424,7 +424,7 @@ static void redudp_read_auth_methods(struct bufferevent *buffev, void *_arg)
 	redudp_client *client = _arg;
 	int do_password = socks5_is_valid_cred(client->instance->config.login, client->instance->config.password);
 	socks5_method_reply reply;
-	int read = evbuffer_remove(buffev->input, &reply, sizeof(reply));
+	int read = evbuffer_remove(bufferevent_get_input(buffev), &reply, sizeof(reply));
 	const char *error = NULL;
 	int ierror = 0;
 	redudp_log_error(client, LOG_DEBUG, "<trace>");
@@ -447,7 +447,7 @@ static void redudp_read_auth_methods(struct bufferevent *buffev, void *_arg)
 		if (ierror)
 			goto fail;
 
-		client->relay->readcb = redudp_read_assoc_reply;
+		red_bufferevent_set_readcb(client->relay, redudp_read_assoc_reply);
 	}
 	else if (reply.method == socks5_auth_password) {
 		ierror = redsocks_write_helper_ex_plain(
@@ -456,7 +456,7 @@ static void redudp_read_auth_methods(struct bufferevent *buffev, void *_arg)
 		if (ierror)
 			goto fail;
 
-		client->relay->readcb = redudp_read_auth_reply;
+		red_bufferevent_set_readcb(client->relay, redudp_read_auth_reply);
 	}
 
 	return;
@@ -484,8 +484,7 @@ static void redudp_relay_connected(struct bufferevent *buffev, void *_arg)
 	if (error)
 		goto fail;
 
-	client->relay->readcb = redudp_read_auth_methods;
-	client->relay->writecb = 0;
+	red_bufferevent_setcb(client->relay, redudp_read_auth_methods, NULL);
 	//bufferevent_disable(buffev, EV_WRITE); // I don't want to check for writeability.
 	return;
 
@@ -524,7 +523,7 @@ static void redudp_first_pkt_from_client(redudp_instance *self, struct sockaddr_
 	memcpy(&client->clientaddr, clientaddr, sizeof(*clientaddr));
 	if (destaddr)
 		memcpy(&client->destaddr, destaddr, sizeof(client->destaddr));
-	evtimer_set(&client->timeout, redudp_timeout, client);
+	evtimer_assign(&client->timeout, redsocks_event_base(), redudp_timeout, client);
 	// XXX: self->relay_ss->init(client);
 
 	client->sender_fd = -1; // it's postponed until socks-server replies to avoid trivial DoS
@@ -692,6 +691,7 @@ static int redudp_onenter(parser_section *section)
 	}
 
 	INIT_LIST_HEAD(&instance->list);
+	list_add(&instance->list, &instances);
 	INIT_LIST_HEAD(&instance->clients);
 	instance->config.bindaddr.sin_family = AF_INET;
 	instance->config.bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -737,7 +737,7 @@ static int redudp_onexit(parser_section *section)
 		return -1;
 	}
 
-	list_add(&instance->list, &instances);
+
 
 	return 0;
 }
@@ -791,7 +791,7 @@ static int redudp_init_instance(redudp_instance *instance)
 		goto fail;
 	}
 
-	event_set(&instance->listener, fd, EV_READ | EV_PERSIST, redudp_pkt_from_client, instance);
+	event_assign(&instance->listener, redsocks_event_base(), fd, EV_READ | EV_PERSIST, redudp_pkt_from_client, instance);
 	error = event_add(&instance->listener, NULL);
 	if (error) {
 		log_errno(LOG_ERR, "event_add");

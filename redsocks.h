@@ -4,7 +4,10 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <assert.h>
-#include <event.h>
+#include <event2/event.h>
+#include <event2/event_struct.h>
+#include <event2/bufferevent.h>
+#include <openssl/ssl.h>
 #include "list.h"
 #include "parser.h"
 
@@ -16,8 +19,8 @@ typedef struct relay_subsys_t {
 	char   *name;
 	size_t  payload_len; // size of relay-specific data in client section
 	size_t  instance_payload_len; // size of relay-specify data in instance section
-	evbuffercb readcb;
-	evbuffercb writecb;
+	bufferevent_data_cb readcb;
+	bufferevent_data_cb writecb;
 	void       (*init)(struct redsocks_client_t *client);
 	void       (*fini)(struct redsocks_client_t *client);
 	void       (*instance_init)(struct redsocks_instance_t *instance);
@@ -34,6 +37,10 @@ typedef struct redsocks_config_t {
 	char *password;
 	uint16_t listenq;
 	bool use_splice;
+	bool tls;
+	char *tls_host;
+	char *tls_ca;
+	char *cntlm_context;
 	enum disclose_src_e disclose_src;
 	enum on_proxy_fail_e on_proxy_fail;
 } redsocks_config;
@@ -44,6 +51,7 @@ typedef struct redsocks_instance_t {
 	struct event    listener;
 	list_head       clients;
 	relay_subsys   *relay_ss;
+	SSL_CTX *tls_context;
 } redsocks_instance;
 
 typedef unsigned short evshut_t; // EV_READ | EV_WRITE
@@ -98,10 +106,12 @@ static inline redsocks_pump* red_pump(redsocks_client *c)
 	return (redsocks_pump*)c;
 }
 
-void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how);
+/* Return false if completing the shutdown freed the client. */
+bool redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how);
 void redsocks_drop_client(redsocks_client *client);
 void redsocks_touch_client(redsocks_client *client);
 void redsocks_connect_relay(redsocks_client *client);
+void redsocks_cntlm_handoff(redsocks_client *client, const char *authority);
 void redsocks_start_relay(redsocks_client *client);
 bool redsocks_has_splice_instance();
 

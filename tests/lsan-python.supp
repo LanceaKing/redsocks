@@ -1,0 +1,8 @@
+# CPython retains interpreter allocations at exit. Only its allocator frames
+# are suppressed; malloc/calloc in redsocks, cntlm, libevent and OpenSSL remain
+# checked, including when those functions are called through ctypes.
+leak:_PyObject_Malloc
+leak:PyObject_Malloc
+leak:PyMem_Malloc
+leak:_PyMem_RawMalloc
+leak:PyMem_RawMalloc

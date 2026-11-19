@@ -4,6 +4,15 @@ from pathlib import Path
 
 import pytest
 
+# The runtime is resident in this interpreter after tests/run preloads it.
+# Child services/executables use their own linked runtime and ordinary preload.
+if os.environ.pop("REDSOCKS_ASAN_PYTHON", "") == "1":
+    previous = os.environ.pop("REDSOCKS_CHILD_LD_PRELOAD", "")
+    if previous:
+        os.environ["LD_PRELOAD"] = previous
+    else:
+        os.environ.pop("LD_PRELOAD", None)
+
 from native_network import Network, TANKS, TANKS_BASE, pmap
 
 

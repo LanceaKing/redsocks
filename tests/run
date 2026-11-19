@@ -3,6 +3,15 @@ set -eu
 tests=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 python=${PYTHON:-python3}
 if [ "$(id -u)" -ne 0 ]; then
-    exec sudo -E "$(command -v "$python")" -m pytest -v "$tests" "$@"
+    exec sudo -E "$tests/run" "$@"
+fi
+if [ -n "${REDSOCKS_ASAN_RUNTIME:-}" ]; then
+    # ctypes loads the instrumented .so into Python; its runtime must be first.
+    export REDSOCKS_CHILD_LD_PRELOAD="${LD_PRELOAD:-}"
+    export LD_PRELOAD="$REDSOCKS_ASAN_RUNTIME${LD_PRELOAD:+:$LD_PRELOAD}"
+    export REDSOCKS_ASAN_PYTHON=1
+    export LSAN_OPTIONS="${LSAN_OPTIONS:+$LSAN_OPTIONS:}suppressions=$tests/lsan-python.supp"
+    # Sanitizers may terminate Python before pytest can replay captured output.
+    set -- --capture=no "$@"
 fi
 exec "$python" -m pytest -v "$tests" "$@"

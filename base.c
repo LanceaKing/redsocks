@@ -19,13 +19,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <sys/stat.h>
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
-#include <pwd.h>
-#include <grp.h>
 #include <stdlib.h>
 #include "config.h"
 #if defined USE_IPTABLES
@@ -251,9 +248,11 @@ int apply_tcp_keepalive(int fd)
 {
 	struct { int level, option, value; } opt[] = {
 		{ SOL_SOCKET, SO_KEEPALIVE, 1 },
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPCNT) && defined(TCP_KEEPINTVL)
 		{ IPPROTO_TCP, TCP_KEEPIDLE, instance.tcp_keepalive_time },
 		{ IPPROTO_TCP, TCP_KEEPCNT, instance.tcp_keepalive_probes },
 		{ IPPROTO_TCP, TCP_KEEPINTVL, instance.tcp_keepalive_intvl },
+#endif
 	};
 	for (int i = 0; i < SIZEOF_ARRAY(opt); ++i) {
 		if (opt[i].value) {
@@ -374,150 +373,30 @@ static parser_section base_conf_section =
 /***********************************************************************
  * `base` initialization
  */
-static int base_fini();
-
 static int base_init(struct event_base *evbase)
 {
 	UNUSED(evbase);
-	uid_t uid = -1;
-	gid_t gid = -1;
-	int devnull = -1;
-
-	if (!instance.configured) {
-		log_error(LOG_ERR, "there is no configured instance of `base`, check config file");
+	if (!instance.configured || !instance.redirector) return -1;
+	/* A library must never change its host process identity or environment. */
+	if (instance.daemon || instance.chroot || instance.user || instance.group || instance.rlimit_nofile) {
+		log_error(LOG_ERR, "daemon, chroot, user, group and rlimit_nofile are unavailable in library mode");
 		return -1;
 	}
-
-	if (instance.redirector->init && instance.redirector->init() < 0)
-		return -1;
-
-	if (instance.user) {
-		struct passwd *pw = getpwnam(instance.user);
-		if (pw == NULL) {
-			log_errno(LOG_ERR, "getpwnam(%s)", instance.user);
-			goto fail;
-		}
-		uid = pw->pw_uid;
-	}
-
-	if (instance.group) {
-		struct group *gr = getgrnam(instance.group);
-		if (gr == NULL) {
-			log_errno(LOG_ERR, "getgrnam(%s)", instance.group);
-			goto fail;
-		}
-		gid = gr->gr_gid;
-	}
-
-	if (log_preopen(
-			instance.log_name ? instance.log_name : instance.daemon ? "syslog:daemon" : "stderr",
-			instance.log_debug,
-			instance.log_info
-	) < 0 ) {
-		goto fail;
-	}
-
-	if (instance.rlimit_nofile) {
-		struct rlimit rlmt;
-		rlmt.rlim_cur = instance.rlimit_nofile;
-		rlmt.rlim_max = instance.rlimit_nofile;
-		if (setrlimit(RLIMIT_NOFILE, &rlmt) != 0) {
-			log_errno(LOG_ERR, "setrlimit(RLIMIT_NOFILE, %u)", instance.rlimit_nofile);
-			goto fail;
-		}
-	} else {
-		struct rlimit rlmt;
-		if (getrlimit(RLIMIT_NOFILE, &rlmt) != 0) {
-			log_errno(LOG_ERR, "getrlimit(RLIMIT_NOFILE)");
-			goto fail;
-		}
-		instance.rlimit_nofile = rlmt.rlim_cur;
-	}
-
-	if (!instance.redsocks_conn_max) {
-		instance.redsocks_conn_max = (instance.rlimit_nofile - instance.rlimit_nofile / 4)
-			/ (redsocks_has_splice_instance() ? 6 : 2);
-	}
-
-	if (instance.daemon) {
-		devnull = open("/dev/null", O_RDWR);
-		if (devnull == -1) {
-			log_errno(LOG_ERR, "open(\"/dev/null\", O_RDWR");
-			goto fail;
-		}
-	}
-
-	if (instance.chroot) {
-		if (chroot(instance.chroot) < 0) {
-			log_errno(LOG_ERR, "chroot(%s)", instance.chroot);
-			goto fail;
-		}
-	}
-
-	if (instance.daemon || instance.chroot) {
-		if (chdir("/") < 0) {
-			log_errno(LOG_ERR, "chdir(\"/\")");
-			goto fail;
-		}
-	}
-
-	if (instance.group) {
-		if (setgid(gid) < 0) {
-			log_errno(LOG_ERR, "setgid(%i)", gid);
-			goto fail;
-		}
-	}
-
-	if (instance.user) {
-		if (setuid(uid) < 0) {
-			log_errno(LOG_ERR, "setuid(%i)", uid);
-			goto fail;
-		}
-	}
-
-	if (instance.daemon) {
-		switch (fork()) {
-		case -1: // error
-			log_errno(LOG_ERR, "fork()");
-			goto fail;
-		case 0:  // child
-			break;
-		default: // parent, pid is returned
-			exit(EXIT_SUCCESS);
-		}
-	}
-
-	log_open(); // child has nothing to do with TTY
-
-	if (instance.daemon) {
-		if (setsid() < 0) {
-			log_errno(LOG_ERR, "setsid()");
-			goto fail;
-		}
-
-		int fds[] = { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO };
-		int *pfd;
-		FOREACH(pfd, fds)
-			if (dup2(devnull, *pfd) < 0) {
-				log_errno(LOG_ERR, "dup2(devnull, %i)", *pfd);
-				goto fail;
-			}
-
-		close(devnull);
-	}
+	if (instance.redirector->init && instance.redirector->init() < 0) return -1;
+	struct rlimit limit;
+	if (getrlimit(RLIMIT_NOFILE, &limit)) return -1;
+	instance.rlimit_nofile = limit.rlim_cur > UINT32_MAX ? UINT32_MAX : limit.rlim_cur;
+	if (!instance.redsocks_conn_max)
+		instance.redsocks_conn_max = (instance.rlimit_nofile - instance.rlimit_nofile / 4) /
+			(redsocks_has_splice_instance() ? 6 : 2);
+	if (log_preopen(instance.log_name ? instance.log_name : "stderr", instance.log_debug, instance.log_info)) return -1;
+	log_open();
 	return 0;
-fail:
-	if (devnull != -1)
-		close(devnull);
-
-	base_fini();
-
-	return -1;
 }
 
 static int base_fini()
 {
-	if (instance.redirector->fini)
+	if (instance.redirector && instance.redirector->fini)
 		instance.redirector->fini();
 
 	free(instance.chroot);

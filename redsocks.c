@@ -23,7 +23,6 @@
 #include <ctype.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <time.h>
 #include <errno.h>
 #include <assert.h>
@@ -41,7 +40,7 @@ static ssize_t red_android_splice(int in, off_t *inoff, int out, off_t *outoff,
 }
 #define splice red_android_splice
 #endif
-#include <event.h>
+#include <event2/event.h>
 #include "list.h"
 #include "parser.h"
 #include "log.h"
@@ -49,7 +48,9 @@ static ssize_t red_android_splice(int in, off_t *inoff, int out, off_t *outoff,
 #include "base.h"
 #include "redsocks.h"
 #include "utils.h"
-#include "libevent-compat.h"
+#include "upstream-tls.h"
+#include "cntlm-embed.h"
+#include <event2/bufferevent_ssl.h>
 
 
 #define REDSOCKS_RELAY_HALFBUFF  4096
@@ -61,7 +62,9 @@ enum pump_state_t {
 
 static const char *redsocks_event_str(unsigned short what);
 static int redsocks_start_bufferpump(redsocks_client *client);
+#ifdef __linux__
 static int redsocks_start_splicepump(redsocks_client *client);
+#endif
 
 static void redsocks_conn_list_del(redsocks_client *client);
 
@@ -95,6 +98,10 @@ static parser_entry redsocks_entries[] =
 	{ .key = "password",   .type = pt_pchar },
 	{ .key = "listenq",    .type = pt_uint16 },
 	{ .key = "splice",     .type = pt_bool },
+	{ .key = "tls", .type = pt_bool },
+	{ .key = "tls_host", .type = pt_pchar },
+	{ .key = "tls_ca", .type = pt_pchar },
+	{ .key = "cntlm_context", .type = pt_pchar },
 	{ .key = "disclose_src", .type = pt_disclose_src },
 	{ .key = "on_proxy_fail", .type = pt_on_proxy_fail },
 	{ }
@@ -138,6 +145,7 @@ static int redsocks_onenter(parser_section *section)
 	}
 
 	INIT_LIST_HEAD(&instance->list);
+	list_add(&instance->list, &instances);
 	INIT_LIST_HEAD(&instance->clients);
 	instance->config.bindaddr.sin_family = AF_INET;
 	instance->config.bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -161,6 +169,10 @@ static int redsocks_onenter(parser_section *section)
 			(strcmp(entry->key, "login") == 0)      ? (void*)&instance->config.login :
 			(strcmp(entry->key, "password") == 0)   ? (void*)&instance->config.password :
 			(strcmp(entry->key, "listenq") == 0)    ? (void*)&instance->config.listenq :
+			(strcmp(entry->key, "tls") == 0) ? (void*)&instance->config.tls :
+			(strcmp(entry->key, "tls_host") == 0) ? (void*)&instance->config.tls_host :
+			(strcmp(entry->key, "tls_ca") == 0) ? (void*)&instance->config.tls_ca :
+			(strcmp(entry->key, "cntlm_context") == 0) ? (void*)&instance->config.cntlm_context :
 			(strcmp(entry->key, "splice") == 0)     ? (void*)&instance->config.use_splice :
 			(strcmp(entry->key, "disclose_src") == 0) ? (void*)&instance->config.disclose_src :
 			(strcmp(entry->key, "on_proxy_fail") == 0) ? (void*)&instance->config.on_proxy_fail :
@@ -189,7 +201,7 @@ static int redsocks_onexit(parser_section *section)
 		FOREACH(ss, relay_subsystems) {
 			if (!strcmp((*ss)->name, instance->config.type)) {
 				instance->relay_ss = *ss;
-				list_add(&instance->list, &instances);
+
 				break;
 			}
 		}
@@ -200,6 +212,26 @@ static int redsocks_onexit(parser_section *section)
 	}
 	else {
 		parser_error(section->context, "no `type` for redsocks");
+		return -1;
+	}
+
+	if (instance->config.tls || instance->config.cntlm_context)
+		instance->config.use_splice = false; /* before sizeof_client/red_payload */
+#ifndef __linux__
+	/* The splice pump requires Linux pipes; use the buffered pump elsewhere. */
+	instance->config.use_splice = false;
+#endif
+	if (instance->config.tls && (!instance->config.tls_host || !*instance->config.tls_host)) {
+		parser_error(section->context, "tls_host is required for upstream TLS");
+		return -1;
+	}
+	if ((instance->config.tls || instance->config.cntlm_context) &&
+	    instance->relay_ss != &http_connect_subsys && instance->relay_ss != &http_relay_subsys) {
+		parser_error(section->context, "TLS/cntlm requires an HTTP relay type");
+		return -1;
+	}
+	if (instance->config.cntlm_context && strcmp(instance->config.cntlm_context, "default")) {
+		parser_error(section->context, "unknown cntlm context");
 		return -1;
 	}
 
@@ -282,8 +314,10 @@ static const char* bufname(redsocks_client *client, struct bufferevent *buf)
 
 static void redsocks_relay_readcb(redsocks_client *client, struct bufferevent *from, struct bufferevent *to)
 {
-	if (evbuffer_get_length(to->output) < to->wm_write.high) {
-		if (bufferevent_write_buffer(to, from->input) == -1)
+	size_t high;
+	bufferevent_getwatermark(to, EV_WRITE, NULL, &high);
+	if (evbuffer_get_length(bufferevent_get_output(to)) < high) {
+		if (bufferevent_write_buffer(to, bufferevent_get_input(from)) == -1)
 			redsocks_log_errno(client, LOG_ERR, "bufferevent_write_buffer");
 	}
 	else {
@@ -297,14 +331,16 @@ static void redsocks_relay_readcb(redsocks_client *client, struct bufferevent *f
 
 static void redsocks_relay_writecb(redsocks_client *client, struct bufferevent *from, struct bufferevent *to)
 {
+	size_t high;
+	bufferevent_getwatermark(to, EV_WRITE, NULL, &high);
 	assert(from == client->client || from == client->relay);
 	char from_eof = (from == client->client ? client->client_evshut : client->relay_evshut) & EV_READ;
 
-	if (evbuffer_get_length(from->input) == 0 && from_eof) {
+	if (evbuffer_get_length(bufferevent_get_input(from)) == 0 && from_eof) {
 		redsocks_shutdown(client, to, SHUT_WR);
 	}
-	else if (evbuffer_get_length(to->output) < to->wm_write.high) {
-		if (bufferevent_write_buffer(to, from->input) == -1)
+	else if (evbuffer_get_length(bufferevent_get_output(to)) < high) {
+		if (bufferevent_write_buffer(to, bufferevent_get_input(from)) == -1)
 			redsocks_log_errno(client, LOG_ERR, "bufferevent_write_buffer");
 		if (!from_eof && !(bufferevent_get_enabled(from) & EV_READ)) {
 			redsocks_log_error(client, LOG_DEBUG, "backpressure: bufferevent_enable(%s, EV_READ)", bufname(client, from));
@@ -349,7 +385,11 @@ void redsocks_start_relay(redsocks_client *client)
 
 	client->state = pump_active;
 
+#ifdef __linux__
 	int error = ((client->instance->config.use_splice) ? redsocks_start_splicepump : redsocks_start_bufferpump)(client);
+#else
+	int error = redsocks_start_bufferpump(client);
+#endif
 	if (!error)
 		redsocks_log_error(client, LOG_DEBUG, "data relaying started");
 	else
@@ -358,15 +398,13 @@ void redsocks_start_relay(redsocks_client *client)
 
 static int redsocks_start_bufferpump(redsocks_client *client)
 {
-	// wm_write.high is respected by libevent-2.0.22 only for ssl and filters,
-	// so it's implemented in redsocks callbacks.  wm_read.high works as expected.
+	/* Socket bufferevents do not enforce the write high watermark. Keep the
+	 * application backpressure checks for both plain and TLS transports. */
 	bufferevent_setwatermark(client->client, EV_READ|EV_WRITE, 0, REDSOCKS_RELAY_HALFBUFF);
 	bufferevent_setwatermark(client->relay, EV_READ|EV_WRITE, 0, REDSOCKS_RELAY_HALFBUFF);
 
-	client->client->readcb = redsocks_relay_clientreadcb;
-	client->client->writecb = redsocks_relay_clientwritecb;
-	client->relay->readcb = redsocks_relay_relayreadcb;
-	client->relay->writecb = redsocks_relay_relaywritecb;
+	red_bufferevent_setcb(client->client, redsocks_relay_clientreadcb, redsocks_relay_clientwritecb);
+	red_bufferevent_setcb(client->relay, redsocks_relay_relayreadcb, redsocks_relay_relaywritecb);
 
 	int error = bufferevent_enable(client->client, (EV_READ|EV_WRITE) & ~(client->client_evshut));
 	if (!error)
@@ -376,6 +414,7 @@ static int redsocks_start_bufferpump(redsocks_client *client)
 	return error;
 }
 
+#ifdef __linux__
 static int pipeprio(redsocks_pump *pump, int fd)
 {
 	// client errors are logged with LOG_INFO, server errors with LOG_NOTICE
@@ -388,7 +427,7 @@ static const char* pipename(redsocks_pump *pump, int fd)
 }
 
 static void bufferevent_free_unused(struct bufferevent **p) {
-	if (*p && !evbuffer_get_length((*p)->input) && !evbuffer_get_length((*p)->output)) {
+	if (*p && !evbuffer_get_length(bufferevent_get_input((*p))) && !evbuffer_get_length(bufferevent_get_output((*p)))) {
 		bufferevent_free(*p);
 		*p = NULL;
 	}
@@ -586,8 +625,8 @@ static void redsplice_relay_write(int fd, short what, void *_pump)
 	redsocks_touch_pump(pump);
 	redsplice_write_ctx c = {
 		.ebsrc = {
-			pump->c.relay ? pump->c.relay->output : NULL,
-			pump->c.client ? pump->c.client->input : NULL,
+			pump->c.relay ? bufferevent_get_output(pump->c.relay) : NULL,
+			pump->c.client ? bufferevent_get_input(pump->c.client) : NULL,
 		},
 		.pisrc = &pump->request,
 		.evsrc = &pump->client_read,
@@ -605,8 +644,8 @@ static void redsplice_client_write(int fd, short what, void *_pump)
 	redsocks_touch_pump(pump);
 	redsplice_write_ctx c = {
 		.ebsrc = {
-			pump->c.client ? pump->c.client->output : NULL,
-			pump->c.relay ? pump->c.relay->input : NULL,
+			pump->c.client ? bufferevent_get_output(pump->c.client) : NULL,
+			pump->c.relay ? bufferevent_get_input(pump->c.relay) : NULL,
 		},
 		.pisrc = &pump->reply,
 		.evsrc = &pump->relay_read,
@@ -628,22 +667,27 @@ static int redsocks_start_splicepump(redsocks_client *client)
 	}
 
 	// going to steal this buffers to the socket
-	evbuffer_unfreeze(client->client->input, 0);
-	evbuffer_unfreeze(client->client->output, 1);
-	evbuffer_unfreeze(client->relay->input, 0);
-	evbuffer_unfreeze(client->relay->output, 1);
+	evbuffer_unfreeze(bufferevent_get_input(client->client), 0);
+	evbuffer_unfreeze(bufferevent_get_output(client->client), 1);
+	evbuffer_unfreeze(bufferevent_get_input(client->relay), 0);
+	evbuffer_unfreeze(bufferevent_get_output(client->relay), 1);
 
 	redsocks_pump *pump = red_pump(client);
-	if (!error)
-		error = pipe2(&pump->request.read, O_NONBLOCK);
-	if (!error)
-		error = pipe2(&pump->reply.read, O_NONBLOCK);
+	int pipe_fds[2];
+	if (!error) {
+		error = pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC);
+		if (!error) { pump->request.read = pipe_fds[0]; pump->request.write = pipe_fds[1]; }
+	}
+	if (!error) {
+		error = pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC);
+		if (!error) { pump->reply.read = pipe_fds[0]; pump->reply.write = pipe_fds[1]; }
+	}
 	if (error) {
 		redsocks_log_errno(client, LOG_ERR, "pipe2");
 		return error;
 	}
 
-	struct event_base *base = NULL;
+	struct event_base *base = redsocks_event_base();
 	const int relay_fd = bufferevent_getfd(client->relay);
 	const int client_fd = bufferevent_getfd(client->client);
 	if (!error)
@@ -670,6 +714,7 @@ static int redsocks_start_splicepump(redsocks_client *client)
 
 	return 0;
 }
+#endif /* __linux__ */
 
 static bool has_loopback_destination(redsocks_client *client)
 {
@@ -751,7 +796,7 @@ void redsocks_drop_client(redsocks_client *client)
 	free(client);
 }
 
-void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how)
+bool redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how)
 {
 	short evhow = 0;
 	const char *strev, *strhow = NULL, *strevhow = NULL;
@@ -759,7 +804,6 @@ void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int 
 
 	assert(how == SHUT_RD || how == SHUT_WR || how == SHUT_RDWR);
 	assert(buffev == client->client || buffev == client->relay);
-	assert(event_get_fd(&buffev->ev_read) == event_get_fd(&buffev->ev_write));
 
 	if (how == SHUT_RD) {
 		strhow = "SHUT_RD";
@@ -782,11 +826,19 @@ void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int 
 	strev = bufname(client, buffev);
 	pevshut = buffev == client->client ? &client->client_evshut : &client->relay_evshut;
 
+	/* Deferred write callbacks can report the same EOF more than once.
+	 * Repeating TLS shutdown would try to consume unread response records. */
+	if ((*pevshut & evhow) == evhow)
+		return true;
+
 	// if EV_WRITE is already shut and we're going to shutdown read then
 	// we're either going to abort data flow (bad behaviour) or confirm EOF
 	// and in this case socket is already SHUT_RD'ed
 	if ( !(how == SHUT_RD && (*pevshut & EV_WRITE)) ) {
-		if (shutdown(event_get_fd(&buffev->ev_read), how) != 0)
+		if (buffev == client->relay && client->instance->config.tls && how != SHUT_RD)
+			redsocks_tls_close(buffev);
+		else if (!(buffev == client->relay && client->instance->config.tls) &&
+		         shutdown(bufferevent_getfd(buffev), how) != 0)
 			redsocks_log_errno(client, LOG_ERR, "shutdown(%s, %s)", strev, strhow);
 	} else {
 		redsocks_log_error(client, LOG_DEBUG, "ignored shutdown(%s, %s)", strev, strhow);
@@ -801,7 +853,9 @@ void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int 
 	if (shut_both(client)) {
 		redsocks_log_error(client, LOG_DEBUG, "both client and server disconnected");
 		redsocks_drop_client(client);
+		return false;
 	}
+	return true;
 }
 
 // I assume that -1 is invalid errno value
@@ -823,19 +877,29 @@ static void redsocks_event_error(struct bufferevent *buffev, short what, void *_
 
 	redsocks_touch_client(client);
 
-	if (what == (EVBUFFER_READ|EVBUFFER_EOF)) {
+	/* The TLS bufferevent reports close_notify as EOF without BEV_EVENT_READING.
+	 * Dirty TLS shutdowns remain errors; allow_dirty_shutdown is not enabled. */
+	if (what == (BEV_EVENT_READING|BEV_EVENT_EOF) ||
+	    (what == BEV_EVENT_EOF && buffev == client->relay && client->instance->config.tls)) {
 		struct bufferevent *antiev;
 		if (buffev == client->relay)
 			antiev = client->client;
 		else
 			antiev = client->relay;
 
-		redsocks_shutdown(client, buffev, SHUT_RD);
+		if (!redsocks_shutdown(client, buffev, SHUT_RD))
+			return;
 
 		// If the client has already sent EOF and the pump is not active
 		// (relay is activating), the code should not shutdown write-pipe.
-		if (client->state == pump_active && antiev != NULL && evbuffer_get_length(antiev->output) == 0)
-			redsocks_shutdown(client, antiev, SHUT_WR);
+		if (client->state == pump_active && antiev != NULL) {
+			/* Deferred TLS reads may leave a final record in the input buffer.
+			 * Queue it before half-closing, then let the write callback drain it. */
+			if (evbuffer_get_length(bufferevent_get_input(buffev)))
+				redsocks_relay_readcb(client, buffev, antiev);
+			if (evbuffer_get_length(bufferevent_get_input(buffev)) == 0 && evbuffer_get_length(bufferevent_get_output(antiev)) == 0)
+				redsocks_shutdown(client, antiev, SHUT_WR);
+		}
 	}
 	else {
 		const int sockrrno = redsocks_socket_geterrno(client, buffev);
@@ -986,17 +1050,68 @@ static void redsocks_relay_connected(struct bufferevent *buffev, void *_arg)
 		goto fail;
 	}
 
-	client->relay->readcb = client->instance->relay_ss->readcb;
-	client->relay->writecb = client->instance->relay_ss->writecb;
-	client->relay->writecb(buffev, _arg);
+	red_bufferevent_setcb(client->relay, client->instance->relay_ss->readcb,
+		client->instance->relay_ss->writecb);
+	client->instance->relay_ss->writecb(buffev, _arg);
 	return;
 
 fail:
 	redsocks_drop_client(client);
 }
 
+static void redsocks_tls_connected(struct bufferevent *bev, short what, void *arg)
+{
+	redsocks_client *client = arg;
+	if (!(what & BEV_EVENT_CONNECTED)) {
+		redsocks_engine_error("Upstream TLS handshake or certificate validation failed");
+		redsocks_drop_client(client);
+		return;
+	}
+	bufferevent_set_timeouts(bev, NULL, NULL);
+	bufferevent_setcb(bev, client->instance->relay_ss->readcb,
+		client->instance->relay_ss->writecb, redsocks_event_error, client);
+	client->instance->relay_ss->writecb(bev, client);
+}
+
+void redsocks_cntlm_handoff(redsocks_client *client, const char *authority)
+{
+	int fd = bufferevent_getfd(client->client);
+	size_t length = evbuffer_get_length(bufferevent_get_input(client->client));
+	const void *prefix = evbuffer_pullup(bufferevent_get_input(client->client), -1);
+	bufferevent_disable(client->client, EV_READ | EV_WRITE);
+	bufferevent_setfd(client->client, -1);
+	if (cntlm_embed_accept(fd, &client->clientaddr, authority, prefix, length))
+		redsocks_close(fd);
+	redsocks_drop_client(client);
+}
+
 void redsocks_connect_relay(redsocks_client *client)
 {
+	if (client->instance->config.tls) {
+		SSL *ssl = redsocks_tls_session(client->instance->tls_context, client->instance->config.tls_host);
+		int fd = red_socket_client(SOCK_STREAM);
+		if (!ssl || fd < 0) {
+			SSL_free(ssl);
+			if (fd >= 0) redsocks_close(fd);
+			redsocks_drop_client(client);
+			return;
+		}
+		/* libevent 2.0 may drain TLS output synchronously; defer callbacks
+		 * until the protocol state transition that queued it has finished. */
+		client->relay = bufferevent_openssl_socket_new(redsocks_event_base(), fd, ssl,
+			BUFFEREVENT_SSL_CONNECTING, BEV_OPT_DEFER_CALLBACKS);
+		if (!client->relay) {
+			SSL_free(ssl); redsocks_close(fd); redsocks_drop_client(client); return;
+		}
+		struct timeval deadline = { 10, 0 };
+		bufferevent_set_timeouts(client->relay, &deadline, &deadline);
+		bufferevent_setcb(client->relay, NULL, NULL, redsocks_tls_connected, client);
+		if (bufferevent_socket_connect(client->relay,
+		    (struct sockaddr *)&client->instance->config.relayaddr, sizeof(struct sockaddr_in)) ||
+		    bufferevent_enable(client->relay, EV_READ | EV_WRITE)) redsocks_drop_client(client);
+		return;
+	}
+
 	client->relay = red_connect_relay(&client->instance->config.relayaddr,
 			                          redsocks_relay_connected, redsocks_event_error, client);
 	if (!client->relay) {
@@ -1150,10 +1265,15 @@ void redsocks_bufferevent_dropfd_internal(redsocks_client *client, struct buffer
 void redsocks_bufferevent_free(struct bufferevent *buffev)
 {
 	int fd = bufferevent_getfd(buffev);
+	SSL *ssl = bufferevent_openssl_get_ssl(buffev);
+	/* Deferred callbacks can retain the bev after free. Stop its I/O before
+	 * detaching the fd and releasing the separately owned SSL object. */
+	bufferevent_disable(buffev, EV_READ | EV_WRITE);
 	if (bufferevent_setfd(buffev, -1)) { // to avoid EBADFD warnings from epoll
 		log_errno(LOG_WARNING, "bufferevent_setfd");
 	}
 	bufferevent_free(buffev);
+	SSL_free(ssl); /* SSL bevs here deliberately do not own the tracked fd. */
 	if (fd != -1)
 		redsocks_close(fd);
 }
@@ -1252,9 +1372,9 @@ static void redsocks_accept_client(int fd, short what, void *_arg)
 
 	redsocks_touch_client(client);
 
-	client->client = bufferevent_new(client_fd, NULL, NULL, redsocks_event_error, client);
+	client->client = redsocks_bev_new(client_fd, NULL, NULL, redsocks_event_error, client);
 	if (!client->client) {
-		log_errno(LOG_ERR, "bufferevent_new");
+		log_errno(LOG_ERR, "redsocks_bev_new");
 		goto fail;
 	}
 	client_fd = -1;
@@ -1284,16 +1404,6 @@ fail:
 		redsocks_close(client_fd);
 }
 
-static const char *redsocks_evshut_str(unsigned short evshut)
-{
-	return
-		evshut == EV_READ ? "SHUT_RD" :
-		evshut == EV_WRITE ? "SHUT_WR" :
-		evshut == (EV_READ|EV_WRITE) ? "SHUT_RDWR" :
-		evshut == 0 ? "" :
-		"???";
-}
-
 static const char *redsocks_event_str(unsigned short what)
 {
 	return
@@ -1302,79 +1412,6 @@ static const char *redsocks_event_str(unsigned short what)
 		what == (EV_READ|EV_WRITE) ? "R/W" :
 		what == 0 ? "-/-" :
 		"???";
-}
-
-static uint32_t redsocks_debug_dump_instance(redsocks_instance *instance, struct timeval *now)
-{
-	redsocks_client *client = NULL;
-	uint32_t conn = 0;
-	char bindaddr_str[RED_INET_ADDRSTRLEN];
-
-	log_error(LOG_NOTICE, "Dumping client list for %s at %s:", instance->config.type, red_inet_ntop(&instance->config.bindaddr, bindaddr_str, sizeof(bindaddr_str)));
-	list_for_each_entry(client, &instance->clients, list) {
-		conn++;
-		const char *s_client_evshut = redsocks_evshut_str(client->client_evshut);
-		const char *s_relay_evshut = redsocks_evshut_str(client->relay_evshut);
-		struct timeval age, idle;
-		timersub(now, &client->first_event, &age);
-		timersub(now, &client->last_event, &idle);
-
-		if (!instance->config.use_splice) {
-			redsocks_log_error(client, LOG_NOTICE, "client: %i (%s)%s%s, relay: %i (%s)%s%s, age: %ld.%06ld sec, idle: %ld.%06ld sec.",
-				client->client ? bufferevent_getfd(client->client) : -1,
-				client->client ? redsocks_event_str(client->client->enabled) : "NULL",
-				s_client_evshut[0] ? " " : "",
-				s_client_evshut,
-				client->relay ? bufferevent_getfd(client->relay) : -1,
-				client->relay ? redsocks_event_str(client->relay->enabled) : "NULL",
-				s_relay_evshut[0] ? " " : "",
-				s_relay_evshut,
-				age.tv_sec, age.tv_usec,
-				idle.tv_sec, idle.tv_usec);
-		} else {
-			redsocks_pump *pump = red_pump(client);
-
-			redsocks_log_error(client, LOG_NOTICE, "client: buf %i (%s) splice %i (%s/%s) pipe[%d, %d]=%zu%s%s, relay: buf %i (%s) splice %i (%s/%s) pipe[%d, %d]=%zu%s%s, age: %ld.%06ld sec, idle: %ld.%06ld sec.",
-				client->client ? bufferevent_getfd(client->client) : -1,
-				client->client ? redsocks_event_str(client->client->enabled) : "NULL",
-				event_get_fd(&pump->client_read),
-				event_pending(&pump->client_read, EV_READ, NULL) ? "R" : "-",
-				event_pending(&pump->client_write, EV_WRITE, NULL) ? "W" : "-",
-				pump->request.read,
-				pump->request.write,
-				pump->request.size,
-				s_client_evshut[0] ? " " : "",
-				s_client_evshut,
-
-				client->relay ? bufferevent_getfd(client->relay) : -1,
-				client->relay ? redsocks_event_str(client->relay->enabled) : "NULL",
-				event_get_fd(&pump->relay_read),
-				event_pending(&pump->relay_read, EV_READ, NULL) ? "R" : "-",
-				event_pending(&pump->relay_write, EV_WRITE, NULL) ? "W" : "-",
-				pump->reply.read,
-				pump->reply.write,
-				pump->reply.size,
-				s_relay_evshut[0] ? " " : "",
-				s_relay_evshut,
-
-				age.tv_sec, age.tv_usec,
-				idle.tv_sec, idle.tv_usec);
-		}
-	}
-	log_error(LOG_NOTICE, "End of client list. %d clients.", conn);
-	return conn;
-}
-
-static void redsocks_debug_dump(int sig, short what, void *_arg)
-{
-	redsocks_instance *instance = NULL;
-	struct timeval now;
-	redsocks_gettimeofday(&now);
-	uint32_t conn = 0;
-
-	list_for_each_entry(instance, &instances, list)
-		conn += redsocks_debug_dump_instance(instance, &now);
-	assert(conn == redsocks_conn);
 }
 
 bool redsocks_has_splice_instance()
@@ -1389,6 +1426,20 @@ bool redsocks_has_splice_instance()
 }
 
 static void redsocks_fini_instance(redsocks_instance *instance);
+
+int redsocks_prepare_transports(void)
+{
+    redsocks_instance *instance;
+    list_for_each_entry(instance, &instances, list) {
+        if (instance->config.cntlm_context && !cntlm_embed_enabled()) return -1;
+        if (instance->config.tls) {
+            instance->tls_context = redsocks_tls_context(instance->config.tls_ca);
+            if (!instance->tls_context) return -1;
+        }
+        if (instance->config.cntlm_context && cntlm_embed_tls(instance->config.tls, instance->config.tls_host)) return -1;
+    }
+    return 0;
+}
 
 static int redsocks_init_instance(redsocks_instance *instance)
 {
@@ -1410,7 +1461,7 @@ static int redsocks_init_instance(redsocks_instance *instance)
 		goto fail;
 	}
 
-	event_set(&instance->listener, fd, EV_READ | EV_PERSIST, redsocks_accept_client, instance);
+	event_assign(&instance->listener, redsocks_event_base(), fd, EV_READ | EV_PERSIST, redsocks_accept_client, instance);
 	fd = -1;
 
 	error = event_add(&instance->listener, NULL);
@@ -1447,7 +1498,7 @@ static void redsocks_fini_instance(redsocks_instance *instance) {
 		}
 	}
 
-	if (instance->relay_ss->instance_fini)
+	if (instance->relay_ss && instance->relay_ss->instance_fini)
 		instance->relay_ss->instance_fini(instance);
 
 	if (event_initialized(&instance->listener)) {
@@ -1462,6 +1513,10 @@ static void redsocks_fini_instance(redsocks_instance *instance) {
 	free(instance->config.type);
 	free(instance->config.login);
 	free(instance->config.password);
+	free(instance->config.tls_host);
+	free(instance->config.tls_ca);
+	free(instance->config.cntlm_context);
+	SSL_CTX_free(instance->tls_context);
 
 	memset(instance, 0, sizeof(*instance));
 	free(instance);
@@ -1469,29 +1524,13 @@ static void redsocks_fini_instance(redsocks_instance *instance) {
 
 static int redsocks_fini();
 
-static struct event debug_dumper;
-
 static int redsocks_init(struct event_base *evbase) {
 	UNUSED(evbase);
-	struct sigaction sa = { }, sa_old = { };
 	redsocks_instance *tmp, *instance = NULL;
-
 	redsocks_conn = 0;
+	accept_backoff_ms = 0;
 
-	sa.sa_handler = SIG_IGN;
-	sa.sa_flags = SA_RESTART;
-	if (sigaction(SIGPIPE, &sa, &sa_old) == -1) {
-		log_errno(LOG_ERR, "sigaction");
-		return -1;
-	}
-
-	signal_set(&debug_dumper, SIGUSR1, redsocks_debug_dump, NULL);
-	if (signal_add(&debug_dumper, NULL) != 0) {
-		log_errno(LOG_ERR, "signal_add");
-		goto fail;
-	}
-
-	event_set(&accept_backoff_ev, -1, 0, redsocks_accept_backoff, NULL);
+	event_assign(&accept_backoff_ev, redsocks_event_base(), -1, 0, redsocks_accept_backoff, NULL);
 
 	list_for_each_entry_safe(instance, tmp, &instances, list) {
 		if (redsocks_init_instance(instance) != 0)
@@ -1501,9 +1540,6 @@ static int redsocks_init(struct event_base *evbase) {
 	return 0;
 
 fail:
-	// that was the first resource allocation, it return's on failure, not goto-fail's
-	sigaction(SIGPIPE, &sa_old, NULL);
-
 	redsocks_fini();
 
 	return -1;
@@ -1517,12 +1553,9 @@ static int redsocks_fini()
 		redsocks_fini_instance(instance);
 
 	assert(redsocks_conn == 0);
-
-	if (signal_initialized(&debug_dumper)) {
-		if (signal_del(&debug_dumper) != 0)
-			log_errno(LOG_WARNING, "signal_del");
-		memset(&debug_dumper, 0, sizeof(debug_dumper));
-	}
+	if (event_initialized(&accept_backoff_ev)) event_del(&accept_backoff_ev);
+	memset(&accept_backoff_ev, 0, sizeof(accept_backoff_ev));
+	accept_backoff_ms = 0;
 
 	return 0;
 }

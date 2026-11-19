@@ -47,7 +47,7 @@ typedef enum httpc_state_t {
 
 typedef struct httpc_client_t {
 	struct event probe_timer;
-	everrorcb original_errorcb;
+	bufferevent_event_cb original_errorcb;
 	char authority[TLS_SNI_HOSTNAME_MAX + 7]; /* hostname, colon, port, NUL */
 	unsigned int auth_retries;
 	bool timer_active;
@@ -61,8 +61,12 @@ static void httpc_client_fini(redsocks_client *client)
 		evtimer_del(&data->probe_timer);
 		data->timer_active = false;
 	}
-	if (client->client && data->original_errorcb)
-		client->client->errorcb = data->original_errorcb;
+	if (client->client && data->original_errorcb) {
+		bufferevent_data_cb readcb, writecb;
+		void *arg;
+		bufferevent_getcb(client->client, &readcb, &writecb, NULL, &arg);
+		bufferevent_setcb(client->client, readcb, writecb, data->original_errorcb, arg);
+	}
 }
 
 static void httpc_choose_target(redsocks_client *client, const char *hostname, const char *reason)
@@ -86,21 +90,24 @@ static void httpc_choose_target(redsocks_client *client, const char *hostname, c
 		data->authority, reason ? "original_ip" : "sni", reason ? reason : "found");
 	/* Keep every sniffed byte in input, and apply backpressure while CONNECT
 	 * and possible 407 reconnections are in progress. */
-	client->client->readcb = NULL;
+	red_bufferevent_set_readcb(client->client, NULL);
 	if (bufferevent_disable(client->client, EV_READ) != 0) {
 		redsocks_log_errno(client, LOG_ERR, "bufferevent_disable");
 		redsocks_drop_client(client);
 		return;
 	}
-	redsocks_connect_relay(client);
+	if (client->instance->config.cntlm_context)
+		redsocks_cntlm_handoff(client, data->authority);
+	else
+		redsocks_connect_relay(client);
 }
 
 static void httpc_probe_read_cb(struct bufferevent *buffev, void *_arg)
 {
 	redsocks_client *client = _arg;
 	char hostname[TLS_SNI_HOSTNAME_MAX + 1];
-	size_t length = evbuffer_get_length(buffev->input);
-	const unsigned char *bytes = evbuffer_pullup(buffev->input, length);
+	size_t length = evbuffer_get_length(bufferevent_get_input(buffev));
+	const unsigned char *bytes = evbuffer_pullup(bufferevent_get_input(buffev), length);
 	if (length && !bytes) {
 		redsocks_drop_client(client);
 		return;
@@ -129,7 +136,7 @@ static void httpc_probe_error_cb(struct bufferevent *buffev, short what, void *_
 {
 	redsocks_client *client = _arg;
 	redsocks_log_error(client, LOG_INFO, "HTTP CONNECT probe stopped reason=%s",
-		(what & EVBUFFER_EOF) ? "client_eof" : "client_error");
+		(what & BEV_EVENT_EOF) ? "client_eof" : "client_error");
 	redsocks_drop_client(client);
 }
 
@@ -137,9 +144,10 @@ static void httpc_connect_relay(redsocks_client *client)
 {
 	httpc_client *data = red_payload(client);
 	struct timeval now, elapsed, deadline = { 1, 0 }, remaining;
-	data->original_errorcb = client->client->errorcb;
-	client->client->readcb = httpc_probe_read_cb;
-	client->client->errorcb = httpc_probe_error_cb;
+	bufferevent_data_cb writecb;
+	void *arg;
+	bufferevent_getcb(client->client, NULL, &writecb, &data->original_errorcb, &arg);
+	bufferevent_setcb(client->client, httpc_probe_read_cb, writecb, httpc_probe_error_cb, arg);
 	bufferevent_setwatermark(client->client, EV_READ, 1, TLS_SNI_PROBE_MAX);
 	if (redsocks_gettimeofday(&now) != 0) {
 		httpc_choose_target(client, NULL, "probe_clock_error");
@@ -151,7 +159,7 @@ static void httpc_connect_relay(redsocks_client *client)
 		return;
 	}
 	timersub(&deadline, &elapsed, &remaining);
-	evtimer_set(&data->probe_timer, httpc_probe_timeout_cb, client);
+	evtimer_assign(&data->probe_timer, redsocks_event_base(), httpc_probe_timeout_cb, client);
 	if (evtimer_add(&data->probe_timer, &remaining) != 0) {
 		redsocks_log_errno(client, LOG_ERR, "evtimer_add");
 		redsocks_drop_client(client);
@@ -206,14 +214,14 @@ static void httpc_read_cb(struct bufferevent *buffev, void *_arg)
 {
 	redsocks_client *client = _arg;
 	httpc_client *data = red_payload(client);
-	size_t length = evbuffer_get_length(buffev->input), delimiter = 4;
+	size_t length = evbuffer_get_length(bufferevent_get_input(buffev)), delimiter = 4;
 	assert(client->relay == buffev);
 	assert(client->state == httpc_request_sent);
 	redsocks_touch_client(client);
 
-	struct evbuffer_ptr end = evbuffer_search(buffev->input, "\r\n\r\n", 4, NULL);
+	struct evbuffer_ptr end = evbuffer_search(bufferevent_get_input(buffev), "\r\n\r\n", 4, NULL);
 	if (end.pos < 0) {
-		end = evbuffer_search(buffev->input, "\n\n", 2, NULL);
+		end = evbuffer_search(bufferevent_get_input(buffev), "\n\n", 2, NULL);
 		delimiter = 2;
 	}
 	if (end.pos < 0) {
@@ -233,7 +241,7 @@ static void httpc_read_cb(struct bufferevent *buffev, void *_arg)
 		redsocks_drop_client(client);
 		return;
 	}
-	evbuffer_copyout(buffev->input, headers, headers_length);
+	evbuffer_copyout(bufferevent_get_input(buffev), headers, headers_length);
 	headers[headers_length] = '\0';
 	unsigned int code = 0;
 	if (memchr(headers, '\0', headers_length) ||
@@ -263,21 +271,23 @@ static void httpc_read_cb(struct bufferevent *buffev, void *_arg)
 	free(headers);
 
 	if (code >= 200 && code <= 299) {
-		evbuffer_drain(buffev->input, headers_length);
+		evbuffer_drain(bufferevent_get_input(buffev), headers_length);
 		/* Move the original bytes exactly once, only after final 2xx headers.
 		 * Both the buffer and splice pumps drain relay->output first. */
-		if (bufferevent_write_buffer(client->relay, client->client->input) != 0)
+		if (bufferevent_write_buffer(client->relay, bufferevent_get_input(client->client)) != 0)
 			goto fail;
 	} else if (client->instance->config.on_proxy_fail == ONFAIL_FORWARD_HTTP_ERR) {
-		evbuffer_drain(client->client->input, evbuffer_get_length(client->client->input));
-		redsocks_shutdown(client, client->client, SHUT_RD);
-		redsocks_shutdown(client, client->relay, SHUT_WR);
+		evbuffer_drain(bufferevent_get_input(client->client), evbuffer_get_length(bufferevent_get_input(client->client)));
+		if (!redsocks_shutdown(client, client->client, SHUT_RD))
+			return;
+		if (!redsocks_shutdown(client, client->relay, SHUT_WR))
+			return;
 	} else {
 		goto fail;
 	}
 	/* Include any bytes already received after the response headers, rather
 	 * than waiting for a new socket read to wake the buffer pump. */
-	if (bufferevent_write_buffer(client->client, client->relay->input) != 0)
+	if (bufferevent_write_buffer(client->client, bufferevent_get_input(client->relay)) != 0)
 		goto fail;
 	client->state = httpc_headers_skipped;
 	redsocks_start_relay(client); /* may free client */

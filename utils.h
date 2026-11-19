@@ -3,9 +3,29 @@
 
 #include <stddef.h>
 #include <time.h>
-#include <event.h>
+#include <event2/event.h>
+#include <event2/bufferevent.h>
+#include <event2/buffer.h>
 
 struct sockaddr_in;
+
+/* Change protocol callbacks while preserving the owner and error handler. */
+static inline void red_bufferevent_setcb(struct bufferevent *bev,
+        bufferevent_data_cb readcb, bufferevent_data_cb writecb)
+{
+    bufferevent_event_cb eventcb;
+    void *arg;
+    bufferevent_getcb(bev, NULL, NULL, &eventcb, &arg);
+    bufferevent_setcb(bev, readcb, writecb, eventcb, arg);
+}
+
+static inline void red_bufferevent_set_readcb(struct bufferevent *bev,
+        bufferevent_data_cb readcb)
+{
+    bufferevent_data_cb writecb;
+    bufferevent_getcb(bev, NULL, &writecb, NULL, NULL);
+    red_bufferevent_setcb(bev, readcb, writecb);
+}
 
 #define SIZEOF_ARRAY(arr)        (sizeof(arr) / sizeof(arr[0]))
 #define FOREACH(ptr, array)      for (ptr = array; ptr < array + SIZEOF_ARRAY(array); ptr++)
@@ -51,7 +71,7 @@ uint32_t red_randui32();
 time_t redsocks_time(time_t *t);
 int redsocks_gettimeofday(struct timeval *tv);
 char *redsocks_evbuffer_readline(struct evbuffer *buf);
-struct bufferevent* red_connect_relay(struct sockaddr_in *addr, evbuffercb writecb, everrorcb errorcb, void *cbarg);
+struct bufferevent* red_connect_relay(struct sockaddr_in *addr, bufferevent_data_cb writecb, bufferevent_event_cb errorcb, void *cbarg);
 int red_socket_geterrno(struct bufferevent *buffev);
 int red_socket_client(int type);
 int red_socket_server(int type, struct sockaddr_in *bindaddr);
@@ -62,12 +82,12 @@ int fcntl_nonblock(int fd);
 
 #define event_fmt_str "%s|%s|%s|%s|%s|0x%x"
 #define event_fmt(what) \
-				(what) & EVBUFFER_READ ? "EVBUFFER_READ" : "0", \
-				(what) & EVBUFFER_WRITE ? "EVBUFFER_WRITE" : "0", \
-				(what) & EVBUFFER_EOF ? "EVBUFFER_EOF" : "0", \
-				(what) & EVBUFFER_ERROR ? "EVBUFFER_ERROR" : "0", \
-				(what) & EVBUFFER_TIMEOUT ? "EVBUFFER_TIMEOUT" : "0", \
-				(what) & ~(EVBUFFER_READ|EVBUFFER_WRITE|EVBUFFER_EOF|EVBUFFER_ERROR|EVBUFFER_TIMEOUT)
+				(what) & BEV_EVENT_READING ? "BEV_EVENT_READING" : "0", \
+				(what) & BEV_EVENT_WRITING ? "BEV_EVENT_WRITING" : "0", \
+				(what) & BEV_EVENT_EOF ? "BEV_EVENT_EOF" : "0", \
+				(what) & BEV_EVENT_ERROR ? "BEV_EVENT_ERROR" : "0", \
+				(what) & BEV_EVENT_TIMEOUT ? "BEV_EVENT_TIMEOUT" : "0", \
+				(what) & ~(BEV_EVENT_READING|BEV_EVENT_WRITING|BEV_EVENT_EOF|BEV_EVENT_ERROR|BEV_EVENT_TIMEOUT)
 
 #if INET6_ADDRSTRLEN < INET_ADDRSTRLEN
 #	error Impossible happens: INET6_ADDRSTRLEN < INET_ADDRSTRLEN

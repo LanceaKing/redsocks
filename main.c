@@ -1,192 +1,99 @@
-/* redsocks - transparent TCP-to-proxy redirector
- * Copyright (C) 2007-2018 Leonid Evdokimov <leon@darkk.net.ru>
- *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not
- * use this file except in compliance with the License.  You may obtain a copy
- * of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
- * License for the specific language governing permissions and limitations
- * under the License.
- */
-
-#include <sys/time.h>
-#include <sys/types.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <signal.h>
-#include <string.h>
-#include <assert.h>
-#include <event.h>
-#include "log.h"
-#include "main.h"
-#include "utils.h"
+/* Native regression CLI: lifecycle and forwarding are the shared library's. */
+#include "engine.h"
 #include "version.h"
-#include "config.h"
-#include "base.h"
+#include <signal.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
-extern app_subsys redsocks_subsys;
-extern app_subsys debug_subsys;
-extern app_subsys base_subsys;
-extern app_subsys redudp_subsys;
-extern app_subsys dnstc_subsys;
-extern app_subsys dnsu2t_subsys;
-
-app_subsys *subsystems[] = {
-	&redsocks_subsys,
-#ifdef DBG_BUILD
-	&debug_subsys,
+static int wait_signal(const sigset_t *signals, const struct timespec *interval) {
+#ifdef __APPLE__
+    /* Darwin has sigwait but no sigtimedwait. Only this thread consumes the
+     * blocked CLI signals, so a pending signal can be waited for immediately. */
+    sigset_t pending;
+    if (sigpending(&pending)) return -1;
+    for (int signum = 1; signum < NSIG; ++signum) {
+        if (sigismember(signals, signum) == 1 && sigismember(&pending, signum) == 1) {
+            sigset_t one;
+            sigemptyset(&one); sigaddset(&one, signum);
+            int received;
+            return sigwait(&one, &received) ? -1 : received;
+        }
+    }
+    nanosleep(interval, NULL);
+    return -1;
+#else
+    return sigtimedwait(signals, NULL, interval);
 #endif
-	&base_subsys,
-	&redudp_subsys,
-	&dnstc_subsys,
-	&dnsu2t_subsys,
-};
-
-static const char *confname = "redsocks.conf";
-static const char *pidfile = NULL;
-
-static void terminate(int sig, short what, void *_arg)
-{
-	if (event_loopbreak() != 0)
-		log_error(LOG_WARNING, "event_loopbreak");
 }
 
-int main(int argc, char **argv)
-{
-	int error;
-	app_subsys **ss;
-	int exit_signals[2] = {SIGTERM, SIGINT};
-	struct event terminators[2];
-	bool conftest = false;
-	int opt;
-	int i;
-
-	evutil_secure_rng_init();
-	while ((opt = getopt(argc, argv, "h?vtc:p:")) != -1) {
-		switch (opt) {
-		case 't':
-			conftest = true;
-			break;
-		case 'c':
-			confname = optarg;
-			break;
-		case 'p':
-			pidfile = optarg;
-			break;
-		case 'v':
-			puts(redsocks_version);
-			printf("Built with libevent-%s\n", LIBEVENT_VERSION);
-			printf("Runs  with libevent-%s\n", event_get_version());
-			if (LIBEVENT_VERSION_NUMBER != event_get_version_number()) {
-				printf("Warning: libevent version number mismatch.\n"
-				       "  Headers: %8x\n"
-				       "  Runtime: %8x\n", LIBEVENT_VERSION_NUMBER, event_get_version_number());
-			}
-			return EXIT_SUCCESS;
-		default:
-			printf(
-				"Usage: %s [-?hvt] [-c config] [-p pidfile]\n"
-				"  -h, -?       this message\n"
-				"  -v           print version\n"
-				"  -t           test config syntax\n"
-				"  -p           write pid to pidfile\n",
-				argv[0]);
-			return (opt == '?' || opt == 'h') ? EXIT_SUCCESS : EXIT_FAILURE;
-		}
-	}
-
-	if (event_get_struct_event_size() != sizeof(struct event)) {
-		puts("libevent event_get_struct_event_size() != sizeof(struct event)! Check `redsocks -v` and recompile redsocks");
-		return EXIT_FAILURE;
-	}
-
-	FILE *f = fopen(confname, "r");
-	if (!f) {
-		perror("Unable to open config file");
-		return EXIT_FAILURE;
-	}
-
-	parser_context* parser = parser_start(f);
-	if (!parser) {
-		perror("Not enough memory for parser");
-		return EXIT_FAILURE;
-	}
-
-	FOREACH(ss, subsystems)
-		if ((*ss)->conf_section)
-			parser_add_section(parser, (*ss)->conf_section);
-	error = parser_run(parser);
-	parser_stop(parser);
-	fclose(f);
-
-	if (error)
-		return EXIT_FAILURE;
-
-	if (conftest)
-		return EXIT_SUCCESS;
-
-	struct event_base* evbase = event_init();
-	memset(terminators, 0, sizeof(terminators));
-
-	FOREACH(ss, subsystems) {
-		if ((*ss)->init) {
-			error = (*ss)->init(evbase);
-			if (error)
-				goto shutdown;
-		}
-	}
-
-	if (pidfile) {
-		f = fopen(pidfile, "w");
-		if (!f) {
-			perror("Unable to open pidfile for write");
-			return EXIT_FAILURE;
-		}
-		fprintf(f, "%d\n", getpid());
-		fclose(f);
-	}
-
-	assert(SIZEOF_ARRAY(exit_signals) == SIZEOF_ARRAY(terminators));
-	for (i = 0; i < SIZEOF_ARRAY(exit_signals); i++) {
-		signal_set(&terminators[i], exit_signals[i], terminate, NULL);
-		if (signal_add(&terminators[i], NULL) != 0) {
-			log_errno(LOG_ERR, "signal_add");
-			goto shutdown;
-		}
-	}
-
-	if (LIBEVENT_VERSION_NUMBER != event_get_version_number()) {
-		log_error(LOG_WARNING, "libevent version mismatch! headers %8x, runtime %8x\n", LIBEVENT_VERSION_NUMBER, event_get_version_number());
-	}
-
-	log_error(LOG_NOTICE, "redsocks started, conn_max=%u", redsocks_conn_max());
-
-	event_dispatch();
-
-	log_error(LOG_NOTICE, "redsocks goes down");
-
-shutdown:
-	for (i = 0; i < SIZEOF_ARRAY(exit_signals); i++) {
-		if (signal_initialized(&terminators[i])) {
-			if (signal_del(&terminators[i]) != 0)
-				log_errno(LOG_WARNING, "signal_del");
-			memset(&terminators[i], 0, sizeof(terminators[i]));
-		}
-	}
-
-	for (--ss; ss >= subsystems; ss--)
-		if ((*ss)->fini)
-			(*ss)->fini();
-
-	event_base_free(evbase);
-
-	return !error ? EXIT_SUCCESS : EXIT_FAILURE;
+int main(int argc, char **argv) {
+    const char *config = "redsocks.conf", *pidfile = NULL, *cntlm = NULL, *trust = NULL, *detect = NULL;
+    int test = 0, hashes = 0, opt;
+    while ((opt = getopt(argc, argv, "h?vtHc:p:n:C:M:")) != -1) {
+        switch (opt) {
+        case 'c': config = optarg; break;
+        case 'p': pidfile = optarg; break;
+        case 'n': cntlm = optarg; break;
+        case 'C': trust = optarg; break;
+        case 'M': detect = optarg; break;
+        case 'H': hashes = 1; break;
+        case 't': test = 1; break;
+        case 'v': puts(redsocks_version); puts(redsocks_engine_build_info()); return 0;
+        default:
+            printf("Usage: %s [-t] [-c redsocks.conf] [-n cntlm.conf] [-C trust.pem] [-p pidfile]\n"
+                   "       %s -H user domain   (password from stdin)\n"
+                   "       %s -c redsocks.conf -n cntlm.conf -M http://test/url\n", argv[0], argv[0], argv[0]);
+            return opt == 'h' || opt == '?' ? 0 : 1;
+        }
+    }
+    if (hashes) {
+        char password[4096], output[256];
+        if (argc-optind != 2 || !fgets(password, sizeof(password), stdin)) return 1;
+        password[strcspn(password, "\r\n")] = 0;
+        int result = redsocks_engine_hashes(argv[optind], argv[optind+1], password, output, sizeof(output));
+        memset(password, 0, sizeof(password));
+        if (!result) fputs(output, stdout);
+        memset(output, 0, sizeof(output));
+        return result ? 1 : 0;
+    }
+    sigset_t signals;
+    sigemptyset(&signals); sigaddset(&signals, SIGTERM); sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGPIPE); sigaddset(&signals, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &signals, NULL);
+    redsocks_engine_options options = { .config_fd = open(config, O_RDONLY),
+        .cntlm_fd = cntlm ? open(cntlm, O_RDONLY) : -1, .trust_fd = trust ? open(trust, O_RDONLY) : -1 };
+    if (options.config_fd < 0 || (cntlm && options.cntlm_fd < 0) || (trust && options.trust_fd < 0)) {
+        perror("configuration/trust"); return 1;
+    }
+    redsocks_engine *engine = redsocks_engine_create();
+    char diagnostic[512];
+    int result;
+    if (detect) {
+        char output[1024] = {0};
+        result = redsocks_engine_detect(engine, &options, detect, output, sizeof(output));
+        if (!result) fputs(output, stdout);
+    } else result = test ? redsocks_engine_validate(engine, &options) : redsocks_engine_start(engine, &options);
+    close(options.config_fd);
+    if (options.cntlm_fd >= 0) close(options.cntlm_fd);
+    if (options.trust_fd >= 0) close(options.trust_fd);
+    if (!result && !test && !detect) {
+        if (pidfile) { FILE *f = fopen(pidfile, "w"); if (!f) result = -1; else { fprintf(f, "%d\n", getpid()); fclose(f); } }
+        while (!result && redsocks_engine_get_status(engine) == REDSOCKS_RUNNING) {
+            struct timespec interval = { 0, 200000000 };
+            int sig = wait_signal(&signals, &interval);
+            if (sig == SIGTERM || sig == SIGINT) break;
+        }
+        redsocks_engine_request_stop(engine);
+        if (redsocks_engine_join(engine)) result = -1;
+        if (pidfile) unlink(pidfile);
+    }
+    redsocks_engine_diagnostics(engine, diagnostic, sizeof(diagnostic));
+    if (result) fprintf(stderr, "%s\n", *diagnostic ? diagnostic : "Native engine failed");
+    redsocks_engine_destroy(engine);
+    return result ? 1 : 0;
 }
-
-/* vim:set tabstop=4 softtabstop=4 shiftwidth=4: */
-/* vim:set foldmethod=marker foldlevel=32 foldmarker={,}: */

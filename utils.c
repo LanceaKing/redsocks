@@ -26,10 +26,18 @@
 #include "base.h"
 #include "utils.h"
 #include "redsocks.h" // for redsocks_close
+#ifdef __linux__
 #include "libc-compat.h"
+#endif
 
 int red_recv_udp_pkt(int fd, char *buf, size_t buflen, struct sockaddr_in *inaddr, struct sockaddr_in *toaddr)
 {
+#ifndef __linux__
+	if (toaddr) {
+		errno = ENOTSUP;
+		return -1;
+	}
+#endif
 	socklen_t addrlen = sizeof(*inaddr);
 	ssize_t pktlen;
 	struct msghdr msg;
@@ -52,6 +60,7 @@ int red_recv_udp_pkt(int fd, char *buf, size_t buflen, struct sockaddr_in *inadd
 		return -1;
 	}
 
+#ifdef __linux__
 	if (toaddr) {
 		memset(toaddr, 0, sizeof(*toaddr));
 		for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
@@ -75,6 +84,7 @@ int red_recv_udp_pkt(int fd, char *buf, size_t buflen, struct sockaddr_in *inadd
 			return -1;
 		}
 	}
+#endif
 
 	if (addrlen != sizeof(*inaddr)) {
 		log_error(LOG_WARNING, "unexpected address length %u instead of %zu", addrlen, sizeof(*inaddr));
@@ -117,11 +127,7 @@ int redsocks_gettimeofday(struct timeval *tv)
 
 char *redsocks_evbuffer_readline(struct evbuffer *buf)
 {
-#if _EVENT_NUMERIC_VERSION >= 0x02000000
 	return evbuffer_readln(buf, NULL, EVBUFFER_EOL_CRLF);
-#else
-	return evbuffer_readline(buf);
-#endif
 }
 
 int red_socket_client(int type)
@@ -135,6 +141,7 @@ int red_socket_client(int type)
 		goto fail;
 	}
 
+	if (redsocks_apply_socket_mark(fd)) goto fail;
 	error = fcntl_nonblock(fd);
 	if (error) {
 		log_errno(LOG_ERR, "fcntl");
@@ -183,7 +190,7 @@ fail:
 }
 
 
-struct bufferevent* red_connect_relay(struct sockaddr_in *addr, evbuffercb writecb, everrorcb errorcb, void *cbarg)
+struct bufferevent* red_connect_relay(struct sockaddr_in *addr, bufferevent_data_cb writecb, bufferevent_event_cb errorcb, void *cbarg)
 {
 	struct bufferevent *retval = NULL;
 	int relay_fd = -1;
@@ -197,9 +204,9 @@ struct bufferevent* red_connect_relay(struct sockaddr_in *addr, evbuffercb write
 		goto fail;
 	}
 
-	retval = bufferevent_new(relay_fd, NULL, writecb, errorcb, cbarg);
+	retval = redsocks_bev_new(relay_fd, NULL, writecb, errorcb, cbarg);
 	if (!retval) {
-		log_errno(LOG_ERR, "bufferevent_new");
+		log_errno(LOG_ERR, "redsocks_bev_new");
 		goto fail;
 	}
 
@@ -227,9 +234,8 @@ int red_socket_geterrno(struct bufferevent *buffev)
 	int pseudo_errno;
 	socklen_t optlen = sizeof(pseudo_errno);
 
-	assert(event_get_fd(&buffev->ev_read) == event_get_fd(&buffev->ev_write));
 
-	error = getsockopt(event_get_fd(&buffev->ev_read), SOL_SOCKET, SO_ERROR, &pseudo_errno, &optlen);
+	error = getsockopt(bufferevent_getfd(buffev), SOL_SOCKET, SO_ERROR, &pseudo_errno, &optlen);
 	if (error) {
 		log_errno(LOG_ERR, "getsockopt");
 		return -1;

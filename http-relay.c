@@ -145,8 +145,8 @@ static void httpr_relay_read_cb(struct bufferevent *buffev, void *_arg)
 	httpr_buffer_init(&httpr->relay_buffer);
 
 	if (client->state == httpr_request_sent) {
-		size_t len = evbuffer_get_length(buffev->input);
-		char *line = redsocks_evbuffer_readline(buffev->input);
+		size_t len = evbuffer_get_length(bufferevent_get_input(buffev));
+		char *line = redsocks_evbuffer_readline(bufferevent_get_input(buffev));
 		if (line) {
 			httpr_buffer_append(&httpr->relay_buffer, line, strlen(line));
 			httpr_buffer_append(&httpr->relay_buffer, "\r\n", 2);
@@ -165,10 +165,10 @@ static void httpr_relay_read_cb(struct bufferevent *buffev, void *_arg)
 						dropped = 1;
 					} else {
 						free(line);
-						char *auth_request = http_auth_request_header(buffev->input, NULL);
+						char *auth_request = http_auth_request_header(bufferevent_get_input(buffev), NULL);
 
 						if (!auth_request) {
-							redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth required, but no <%s> header found: %s", auth_request_header, line);
+							redsocks_log_error(client, LOG_NOTICE, "HTTP Proxy auth required, but no <%s> header found", auth_request_header);
 							redsocks_drop_client(client);
 							dropped = 1;
 						} else {
@@ -228,7 +228,7 @@ static void httpr_relay_read_cb(struct bufferevent *buffev, void *_arg)
 		return;
 
 	while (client->state == httpr_reply_came) {
-		char *line = redsocks_evbuffer_readline(buffev->input);
+		char *line = redsocks_evbuffer_readline(bufferevent_get_input(buffev));
 		if (line) {
 			httpr_buffer_append(&httpr->relay_buffer, line, strlen(line));
 			httpr_buffer_append(&httpr->relay_buffer, "\r\n", 2);
@@ -443,7 +443,7 @@ static void httpr_client_read_content(struct bufferevent *buffev, redsocks_clien
 	}
 	int error;
 	while (true) {
-		error = evbuffer_remove(buffev->input, post_buffer, post_buffer_len);
+		error = evbuffer_remove(bufferevent_get_input(buffev), post_buffer, post_buffer_len);
 		if (error < 0) {
 			free(post_buffer);
 			redsocks_log_error(client, LOG_ERR, "evbuffer_remove");
@@ -481,7 +481,7 @@ static void httpr_client_read_cb(struct bufferevent *buffev, void *_arg)
 	char *line = NULL;
 	int connect_relay = 0;
 
-	while (!connect_relay && (line = redsocks_evbuffer_readline(buffev->input))) {
+	while (!connect_relay && (line = redsocks_evbuffer_readline(bufferevent_get_input(buffev)))) {
 		int skip_line = 0;
 		int do_drop = 0;
 
@@ -547,9 +547,13 @@ static void httpr_client_read_cb(struct bufferevent *buffev, void *_arg)
 
 static void httpr_connect_relay(redsocks_client *client)
 {
+	if (client->instance->config.cntlm_context) {
+		redsocks_cntlm_handoff(client, NULL);
+		return;
+	}
 	int error;
 
-	client->client->readcb = httpr_client_read_cb;
+	red_bufferevent_set_readcb(client->client, httpr_client_read_cb);
 	error = bufferevent_enable(client->client, EV_READ);
 	if (error) {
 		redsocks_log_errno(client, LOG_ERR, "bufferevent_enable");

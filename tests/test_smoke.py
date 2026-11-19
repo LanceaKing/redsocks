@@ -1,5 +1,9 @@
 from functools import partial
+from contextlib import ExitStack
 from subprocess import CalledProcessError, Popen, PIPE
+from statistics import median
+import json
+import shlex
 import time
 
 import conftest
@@ -10,6 +14,28 @@ BAD_AUTH = 'connect_nopass connect_baduser connect_badpass socks5_nopass socks5_
 UGLY_AUTH = 'httperr_connect_nopass httperr_connect_baduser httperr_connect_badpass'.split()
 assert set(conftest.TANKS) == set(GOOD_AUTH + BAD_AUTH + UGLY_AUTH + ['httperr_proxy_timeout'])
 
+def rejected_http_request(vm, port, record_testsuite_property):
+    started = time.monotonic()
+    with pytest.raises(CalledProcessError) as excinfo:
+        vm.do(r'curl -sS --max-time 0.5 --output /dev/null '
+              r'--write-out "\n%{http_code} %{size_download}" '
+              f'http://10.0.1.80:{port}/')
+    error = excinfo.value
+    status, size = error.output.rsplit('\n', 1)[1].split()
+    record_testsuite_property('http.rejection.%s.%d' % (vm.name, port), json.dumps({
+        'curl_code': error.returncode, 'http_code': int(status), 'body_bytes': int(size),
+        'elapsed_ms': (time.monotonic()-started)*1000, 'diagnostic': error.output}))
+    assert status == '000' and int(size) == 0, error.output
+    return error
+
+def assert_empty_reply(error):
+    # A proxy can reject before the HTTP request is fully consumed. Depending
+    # on packet ordering, TCP closes with FIN (curl 52) or peer RST (curl 56).
+    # Only the explicit peer-reset diagnostic qualifies; HTTP status and body
+    # must already be zero. Timeouts and other receive failures still fail.
+    assert error.returncode == 52 or (error.returncode == 56 and
+        'Recv failure: Connection reset by peer' in error.output), error.output
+
 @pytest.mark.parametrize('tank', GOOD_AUTH)
 def test_smoke(net, tank):
     vm = net.vm['tank%d' % conftest.TANKS[tank]]
@@ -17,11 +43,10 @@ def test_smoke(net, tank):
     assert 'Welcome to nginx!' in page
 
 @pytest.mark.parametrize('tank', BAD_AUTH)
-def test_badauth(net, tank):
+def test_badauth(net, tank, record_testsuite_property):
     vm = net.vm['tank%d' % conftest.TANKS[tank]]
-    with pytest.raises(CalledProcessError) as excinfo:
-        vm.do('curl --max-time 0.5 http://10.0.1.80/')
-    assert excinfo.value.returncode == 52 # Empty reply from server
+    assert_empty_reply(rejected_http_request(vm, 80, record_testsuite_property))
+    net.vm['regw'].wait_idle()
 
 @pytest.mark.parametrize('tank', UGLY_AUTH)
 def test_uglyauth(net, tank):
@@ -30,17 +55,17 @@ def test_uglyauth(net, tank):
     assert '<!-- ERR_CACHE_ACCESS_DENIED -->' in page
 
 @pytest.mark.parametrize('tank', set(conftest.TANKS) - set(UGLY_AUTH + ['httperr_connect_digest']))
-def test_econnrefused(net, tank):
+def test_econnrefused(net, tank, record_testsuite_property):
     vm = net.vm['tank%d' % conftest.TANKS[tank]]
-    with pytest.raises(CalledProcessError) as excinfo:
-        vm.do('curl --max-time 0.5 http://10.0.1.80:81/')
+    error = rejected_http_request(vm, 81, record_testsuite_property)
     if tank == 'httperr_proxy_timeout':
-        assert excinfo.value.returncode == 28 # Operation timed out
+        assert error.returncode == 28 # Operation timed out
         # The client's deadline does not end the kernel's pending upstream
         # connect(). Drain it before later tests record their FD baseline.
         net.vm['regw'].wait_idle(timeout=145)
     else:
-        assert excinfo.value.returncode == 52 # Empty reply from server
+        assert_empty_reply(error)
+        net.vm['regw'].wait_idle()
 
 def test_econnrefused_httperr(net):
     tank = 'httperr_connect_digest'
@@ -50,15 +75,25 @@ def test_econnrefused_httperr(net):
 
 RTT = 200 # ms
 
-@pytest.fixture(scope="function")
-def slow_net(request, net):
+def add_latency(request, net):
     def close():
-        net.vm['gw'].netcall('tc qdisc del dev ethx root')
-        net.vm['gw'].netcall('tc qdisc del dev ethw root')
+        # Deleting netem with pending FINs drops them and leaves connections
+        # occupying the fixture's eight slots until TCP retransmits them.
+        with ExitStack() as cleanup:
+            cleanup.callback(net.stop_timing_pulses)
+            cleanup.callback(net.vm['gw'].netcall, 'tc qdisc del dev ethw root')
+            cleanup.callback(net.vm['gw'].netcall, 'tc qdisc del dev ethx root')
+            net.vm['regw'].wait_idle()
+    net.vm['regw'].wait_idle()
+    net.start_timing_pulses()
     request.addfinalizer(close)
     net.vm['gw'].netcall('tc qdisc add dev ethw root netem delay %dms' % (RTT // 2))
     net.vm['gw'].netcall('tc qdisc add dev ethx root netem delay %dms' % (RTT // 2))
     return net
+
+@pytest.fixture(scope="function")
+def slow_net(request, net):
+    return add_latency(request, net)
 
 LATENCY = {
     'connect_none':     3 * RTT,
@@ -72,38 +107,125 @@ LATENCY = {
 def heatup(vm):
     vm.do('curl -o /dev/null http://10.0.1.80/') # heatup L2 and auth caches
 
-def http_ping(vm):
-    s = vm.do('curl -sS -w %{time_connect}/%{time_total}/%{http_code}/%{size_download} -o /dev/null http://10.0.1.80/')
-    connect, total, code, size = s.split('/')
+def http_ping(vm, proxy_args=()):
+    s = vm.do(shlex.join([
+        'curl', '-sS', *proxy_args,
+        '-w', '%{time_connect}/%{time_total}/%{http_code}/%{size_download}/%{http_connect}/%{num_connects}',
+        '-o', '/dev/null', 'http://10.0.1.80/']))
+    connect, total, code, size, tunnel, connections = s.split('/')
+    assert int(connections) == 1
+    assert int(tunnel) == (200 if '--proxytunnel' in proxy_args else 0)
     connect, total, code, size = float(connect) * 1000, float(total) * 1000, int(code), int(size)
     return connect, total, code, size
 
-@pytest.mark.parametrize('tank', set(conftest.TANKS) & set(LATENCY))
-def test_latency_tank(slow_net, tank):
-    vm = slow_net.vm['tank%d' % conftest.TANKS[tank]]
-    heatup(vm)
-    connect, total, code, size = http_ping(vm)
-    assert code == 200 and size == 612
-    assert connect < 5 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
+def reference_ping(net, tank):
+    # Use stock curl and the same upstream process, without passing through
+    # redsocks. Each command has the same wire RTT count as the tested path.
+    # Cached Digest needs one CONNECT, so its reference uses Squid's open port;
+    # a fresh curl Digest challenge would add an unrelated round trip.
+    proxies = {
+        'connect_none': ('--proxy', 'http://10.0.1.8:8080', '--proxytunnel'),
+        'connect_basic': ('--proxy', 'http://10.0.1.8:8081', '--proxytunnel',
+                          '--proxy-basic', '--proxy-user', 'basic_user:basic_password'),
+        'connect_digest': ('--proxy', 'http://10.0.1.9:8080', '--proxytunnel'),
+        'socks5_none': ('--socks5', '10.0.1.180:1080'),
+        'socks5_auth': ('--socks5', '10.0.1.181:1081', '--socks5-basic',
+                       '--proxy-user', net.account + ':sockpwd'),
+    }
+    # VM.do deliberately disables environment proxies for ordinary clients.
+    return http_ping(net.vm['regw'], ('--noproxy', '', *proxies[tank]))
 
-def test_latency_regw(slow_net):
+def paired_samples(net, tank, concurrency):
+    vm = net.vm['tank%d' % conftest.TANKS[tank]]
+    net.vm['regw'].wait_idle()
+    calls = [function for _ in range(concurrency) for function in (
+        partial(reference_ping, net, tank), partial(http_ping, vm))]
+    begin = time.monotonic()
+    values = conftest.pmap(calls)
+    elapsed = time.monotonic() - begin
+    controls, samples = values[0::2], values[1::2]
+    assert all(code == 200 and size == 612 for _, _, code, size in values)
+    return controls, samples, elapsed
+
+@pytest.fixture
+def timed_net(request, net, record_testsuite_property):
+    concurrency = getattr(request, 'param', 1)
+
+    def measure_direct(label):
+        vm = net.vm['regw']
+        heatup(vm)
+        values = []
+        for _ in range(3):
+            net.vm['regw'].wait_idle()
+            values.extend(conftest.pmap([partial(http_ping, vm) for _ in range(concurrency)]))
+        total = median(total for _, total, _, _ in values)
+        # Record the complete calibration before either assertion can fail.
+        record_testsuite_property('timing.direct.'+label+'.'+request.node.name,
+                                 json.dumps({'concurrency': concurrency,
+                                             'samples_ms': values, 'median_ms': total}))
+        assert all(code == 200 and size == 612 for _, _, code, size in values)
+        return total
+
+    direct_baseline = measure_direct('baseline')
+    baseline = {}
+    for tank in set(conftest.TANKS) & set(LATENCY):
+        heatup(net.vm['tank%d' % conftest.TANKS[tank]])
+        controls, samples = [], []
+        for _ in range(3):
+            control, sample, _ = paired_samples(net, tank, concurrency)
+            controls.extend(control)
+            samples.extend(sample)
+        baseline[tank] = {
+            'reference_ms': median(total for _, total, _, _ in controls),
+            'proxy_ms': median(total for _, total, _, _ in samples),
+        }
+    add_latency(request, net)
+    control = measure_direct('control')
+    record_testsuite_property('timing.'+request.node.name, json.dumps({
+        'concurrency': concurrency, 'baseline_ms': baseline, 'timing_cpus': net.cpus,
+        'direct_baseline_ms': direct_baseline, 'direct_control_ms': control}))
+    assert LATENCY['regw_direct']-RTT*.2 < control < LATENCY['regw_direct']+RTT*.2
+    return net, baseline
+
+def paired_pings(net, baseline, tank, concurrency):
+    vm = net.vm['tank%d' % conftest.TANKS[tank]]
+    heatup(vm)
+    controls, samples, elapsed = paired_samples(net, tank, concurrency)
+    assert all(code == 200 and size == 612 and RTT*.8 < connect < RTT*1.2
+               for connect, _, code, size in controls)
+    assert all(total > LATENCY[tank]-RTT*.2 for _, total, _, _ in controls)
+    service = baseline[tank]
+    expected = median(total for _, total, _, _ in controls) + service['proxy_ms'] - service['reference_ms']
+    return expected, samples, controls, elapsed
+
+@pytest.mark.parametrize('tank', set(conftest.TANKS) & set(LATENCY))
+def test_latency_tank(timed_net, tank, record_testsuite_property):
+    net, baseline = timed_net
+    expected, samples, controls, _ = paired_pings(net, baseline, tank, 1)
+    record_testsuite_property('timing.pair.'+tank, json.dumps({'expected_ms': expected, 'control': controls, 'samples': samples}))
+    (connect, total, code, size), = samples
+    assert code == 200 and size == 612
+    assert connect < 5 and expected-RTT*.2 < total and total < expected+RTT*.2
+
+def test_latency_regw(slow_net, record_testsuite_property):
     vm, tank = slow_net.vm['regw'], 'regw_direct'
     heatup(vm)
     connect, total, code, size = http_ping(vm)
+    record_testsuite_property('timing.direct.regw', json.dumps({
+        'sample_ms': (connect, total, code, size), 'timing_cpus': slow_net.cpus}))
     assert code == 200 and size == 612
     assert RTT*.8 < connect and connect < RTT*1.2 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
 
-def test_nonce_reuse(slow_net):
+@pytest.mark.parametrize('timed_net', [5], indirect=True)
+def test_nonce_reuse(timed_net, record_testsuite_property):
     """ nonce reuse works and has no latency penalty """
     tank = 'connect_digest'
-    vm = slow_net.vm['tank%d' % conftest.TANKS[tank]]
-    heatup(vm)
-    begin = time.time()
-    s = conftest.pmap([partial(http_ping, vm) for _ in range(5)])
-    total_sum = time.time() - begin
+    net, baseline = timed_net
+    expected, s, controls, total_sum = paired_pings(net, baseline, tank, 5)
+    record_testsuite_property('timing.pair.nonce', json.dumps({'expected_ms': expected, 'control': controls, 'samples': s}))
     for connect, total, code, size in s:
         assert code == 200 and size == 612
-        assert connect < 5 and LATENCY[tank]-RTT*.2 < total and total < LATENCY[tank]+RTT*.2
+        assert connect < 5 and expected-RTT*.2 < total and total < expected+RTT*.2
         assert total_sum * 1000 < total * 1.5
 
 @pytest.mark.parametrize('tank, delay', [(t, d)

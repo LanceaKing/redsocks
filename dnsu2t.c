@@ -121,8 +121,8 @@ static void dnsu2t_pkt_from_client(int srvfd, short what, void *_arg)
 		if (fd < 0)
 			goto fail;
 
-		event_set(&self->relay_rd, fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_relay, self);
-		event_set(&self->relay_wr, fd, EV_WRITE, dnsu2t_relay_writable, self);
+		event_assign(&self->relay_rd, redsocks_event_base(), fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_relay, self);
+		event_assign(&self->relay_wr, redsocks_event_base(), fd, EV_WRITE, dnsu2t_relay_writable, self);
 		fd = -1;
 
 		// The timeout on a persistent event resets whenever the event's callback runs.
@@ -155,8 +155,10 @@ static void dnsu2t_pkt_from_client(int srvfd, short what, void *_arg)
 				dnsu2t_log_error(LOG_ERR, "event_del");
 		}
 		inflight_req **new = tsearch(node, &self->inflight_root, inflight_cmp);
-		if (!new)
-			abort(); // ultimate ENOMEM handler
+		if (!new) {
+			dnsu2t_close_relay(self);
+			goto fail;
+		}
 		assert(*new == node); // WAT?
 		node = NULL;
 		dnsu2t_log_error(LOG_DEBUG, "DNS request #%04x", ntohs(in.dns.hdr.id));
@@ -335,6 +337,7 @@ static int dnsu2t_onenter(parser_section *section)
 	}
 
 	INIT_LIST_HEAD(&instance->list);
+	list_add(&instance->list, &instances);
 	instance->config.bindaddr.sin_family = AF_INET;
 	instance->config.bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	instance->config.bindaddr.sin_port = htons(53);;
@@ -367,7 +370,7 @@ static int dnsu2t_onexit(parser_section *section)
 	instance->config.bindaddr.sin_port = htons(instance->config.bindaddr.sin_port);
 	instance->config.relayaddr.sin_port = htons(instance->config.relayaddr.sin_port);
 
-	list_add(&instance->list, &instances);
+
 
 	return 0;
 }
@@ -381,7 +384,7 @@ static int dnsu2t_init_instance(dnsu2t_instance *instance)
 		goto fail;
 	}
 
-	event_set(&instance->listener, fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_client, instance);
+	event_assign(&instance->listener, redsocks_event_base(), fd, EV_READ | EV_PERSIST, dnsu2t_pkt_from_client, instance);
 	error = event_add(&instance->listener, NULL);
 	if (error) {
 		log_errno(LOG_ERR, "event_add");
