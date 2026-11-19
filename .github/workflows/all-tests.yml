@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: LanceaKing/cntlm
-          ref: 5768ff87fd164a153c2e9d2415db7613a9071f4b
+          ref: cab503fb590a4ad35a454a4290f85467b72db787
           path: .deps/cntlm
           persist-credentials: false
 
